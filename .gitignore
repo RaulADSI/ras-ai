@@ -1,0 +1,36 @@
+# .gitignore para rentify-ai
+
+# 📁 Datos sensibles y pesados
+data/raw/
+data/clean/
+data/embedded/
+data/validated/        # Si decides agregar validación semántica
+
+# 📁 Logs de ejecución
+logs/
+*.log
+
+# 📁 Configuración privada
+config/qdrant_settings.yaml
+.env
+
+# 📁 Exportaciones de flujos n8n (pueden contener credenciales)
+flows/n8n/
+
+# 📁 Archivos temporales o de sistema
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# 🧪 Archivos de pruebas locales
+__pycache__/
+*.pyc
+*.pyo
+*.ipynb_checkpoints/
+
+# 🧰 Entornos virtuales
+venv/
+.env/
+.envrc
+.venv/
