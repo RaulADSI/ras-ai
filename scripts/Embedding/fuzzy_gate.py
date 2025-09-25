@@ -21,7 +21,7 @@ try:
     property_directory = pd.read_csv("data/clean/normalized_property_directory.csv")
     vendor_directory = pd.read_csv("data/clean/normalized_vendor_directory.csv")
 except FileNotFoundError as e:
-    print(f"❌ Error: {e}. Please ensure all input CSV files are in the 'data/clean/' directory.")
+    print(f"Error: {e}. Please ensure all input CSV files are in the 'data/clean/' directory.")
     sys.exit()
 
 # --- Helpers ---
@@ -146,12 +146,8 @@ def resolve_transaction_mappings(row):
     return "", "unresolved", 0.0, "", "", ""
 
 def resolve_cash_account(filename: str) -> str:
-    """
-    Determina el Cash Account según el nombre del archivo.
-      - Si contiene 'amex' → '1170: Amex'
-      - Si contiene 'mastercard' → '1180: AA Mastercard'
-      - Si no contiene ninguno → ''
-    """
+  # Determine the Cash Account based on the file name:
+
     fname = filename.lower()
     if "amex" in fname:
         return "1170: Amex"
@@ -226,5 +222,5 @@ new_df.loc[mask, "Bill Account*"] = "6435: General Repairs"
 # --- Save results to CSV---
 output_path = "data/clean/appfolio_ready_bulk.csv"
 new_df.to_csv(output_path, index=False, encoding="utf-8-sig")
-print(f"✅ File generated: {output_path}")
-print("   Remember to manually review 'unresolved' items or those with low confidence.")
+print(f"File generated: {output_path}")
+print("Remember to manually review 'unresolved' items or those with low confidence.")
