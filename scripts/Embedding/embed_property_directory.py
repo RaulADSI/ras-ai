@@ -38,7 +38,7 @@ vectors = np.load("data/embedded/property_directory_embeddings.npy")
 points = []
 for idx, row in df.iterrows():
     point = {
-        "id": str(idx),  # puede ser un UUID si prefieres
+        "id": str(idx),  # Can be UUID or any unique identifier
         "vector": vectors[idx].tolist(),
         "payload": {
             "raw_property": row["raw_property"],
