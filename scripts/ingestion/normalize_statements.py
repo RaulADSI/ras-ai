@@ -5,7 +5,7 @@ import re
 
 # Import normalize
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-from scripts.utils.text_cleaning import normalize
+from scripts.utils.text_cleaning import normalize_vendor as normalize
 
 
 #  Funtion to clean 'merchant' 
