@@ -7,10 +7,15 @@ import re
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from scripts.utils.text_cleaning import normalize_vendor as normalize
 
+  # Delete city suffixes 
+DEFAULT_CITIES = [
+        'MIAMI', 'HIALEAH', 'OPA LOCKA', 'NORTH MIAMI', 'CORAL GABLES',
+        'SUNRISE', 'DAVIE', 'FORT LAUDERDALE', 'HOLLYWOOD', 'MIAMI BEACH',
+        'WESTON', 'POMPANO BEACH', 'LAUDERDALE', 'KENDALL', 'DORAL'
+    ]
+SORTED_DEFAULT_CITIES = sorted(set(c.upper() for c in DEFAULT_CITIES), key=lambda x: -len(x))
 
-#  Funtion to clean 'merchant' 
 def clean_merchant(text: str, remove_cities: list | None = None) -> str:
-    
     if not isinstance(text, str):
         return ""
 
@@ -19,37 +24,29 @@ def clean_merchant(text: str, remove_cities: list | None = None) -> str:
     s = s.rstrip(' ,-')
     up = s.upper()
 
-    # Delete suffixes
     up = re.sub(r'(?:,\s*|\s+)[A-Z]{2}$', '', up).strip()
 
-    # Delete repeated ending words (e.g., "RENT RENT")
     tokens = up.split()
-    max_rep = min(4, len(tokens)//2)
-    for n in range(1, max_rep+1):
-        if tokens[-2*n:-n] == tokens[-n:]:
-            tokens = tokens[:-n]
-            up = ' '.join(tokens)
-            break
+    if len(tokens) >= 2:
+        max_rep = min(4, len(tokens)//2)
+        for n in range(1, max_rep+1):
+            if tokens[-2*n:-n] == tokens[-n:]:
+                tokens = tokens[:-n]
+                up = ' '.join(tokens)
+                break
+    
+    # ✨ IMPROVEMENT: Use the pre-sorted city list.
+    cities_to_remove = SORTED_DEFAULT_CITIES
+    if remove_cities: # Allow override if a custom list is provided
+        cities_to_remove = sorted(set(c.upper() for c in remove_cities), key=lambda x: -len(x))
 
-    # Delete city suffixes 
-    default_cities = [
-        'MIAMI', 'HIALEAH', 'OPA LOCKA', 'NORTH MIAMI', 'CORAL GABLES',
-        'SUNRISE', 'DAVIE', 'FORT LAUDERDALE', 'HOLLYWOOD', 'MIAMI BEACH',
-        'WESTON', 'POMPANO BEACH', 'LAUDERDALE', 'KENDALL', 'DORAL'
-    ]
-    cities = [c.upper() for c in (remove_cities or default_cities)]
-    cities = sorted(set(cities), key=lambda x: -len(x))  
-    for city in cities:
+    for city in cities_to_remove:
         if up.endswith(city):
-            up = up[: -len(city)].strip()
-            up = re.sub(r'[,\s]+$', '', up)
+            up = up[:-len(city)].strip(' ,-')
             break
 
-    # Final cleanup
-    up = re.sub(r'\s+', ' ', up).strip(' ,-')
-
-    return up
-
+    return up.strip()
+   
 
 # load data
 df = pd.read_csv("data/raw/amex_statement.csv")
