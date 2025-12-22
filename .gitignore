@@ -4,7 +4,7 @@
 data/raw/
 data/clean/
 data/embedded/
-data/validated/        # Si decides agregar validación semántica
+data/master/        
 
 # 📁 Logs de ejecución
 logs/
