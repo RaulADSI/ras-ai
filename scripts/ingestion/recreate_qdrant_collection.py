@@ -9,7 +9,7 @@ client.recreate_collection(
     collection_name="rag_collection",
     vectors_config=VectorParams(
         size=768,
-        distance=Distance.COSINE  # Puedes usar EUCLID o DOT si prefieres
+        distance=Distance.COSINE  
     )
 )
 
