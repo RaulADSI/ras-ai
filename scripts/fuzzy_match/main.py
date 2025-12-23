@@ -19,7 +19,22 @@ def extract_gl_info(gl_val):
     return parts[0], parts[1] if len(parts) > 1 else ""
 
 def main():
-    print("🚀 Iniciando procesamiento RAS con mapeo estricto...")
+    print("Iniciando procesamiento RAS con mapeo estricto...")
+    
+    # Detectar cuál archivo procesar
+    if os.path.exists("data/clean/normalized_amex.csv"):
+        path = "data/clean/normalized_amex.csv"
+        card_key = "amex"
+    else:
+        path = "data/clean/normalized_citi.csv"
+        card_key = "mastercard"
+
+    df = pd.read_csv(path)
+    rules_df = pd.read_excel("data/master/mapping_rules.xlsx", sheet_name="Rules")
+
+    # 1. Obtener la Cash Account desde el Excel dinámicamente
+    cash_master = {str(k).lower().strip(): v for k, v in rules_df[rules_df["Category"] == "Cash"][["Raw_Text (Key)", "Mapped_Value"]].values}
+    selected_cash_account = cash_master.get(card_key, "1150: Operating")
 
     # --- 1. Cargar Recursos ---
     df = pd.read_csv("data/clean/normalized_statement_citi.csv")
@@ -30,7 +45,7 @@ def main():
     gl_choices = gl_directory["code_raw"].dropna().tolist()
 
     # Normalización de Diccionarios desde Excel para evitar fallos por espacios o mayúsculas
-    # Vendor: { 'RAW BANK TEXT': 'Clean Name' }
+    # Vendor: { 'RAW TEXT': 'Cleaned Vendor Name' }
     v_master = {str(k).upper().strip(): v for k, v in rules_df[rules_df["Category"] == "Vendor"][["Raw_Text (Key)", "Mapped_Value"]].values}
     
     # Property: { 'CODE/SHORT NAME': 'Full AppFolio Name' }
@@ -45,7 +60,7 @@ def main():
     df = df[df["company"].astype(str).str.upper() == "RAS"].copy()
 
     if df.empty:
-        print("⚠️ No hay transacciones RAS")
+        print("No hay transacciones RAS")
         return
 
     # Extraer hints de la columna gl_account del banco
@@ -109,8 +124,8 @@ def main():
         "Bill Date*": df["date"],
         "Due Date*": df["date"],
         "Posting Date*": df["date"],
-        "Description": "Citi 1180 | " + df["merchant"].astype(str),
-        "Cash Account": "1180: AA Mastercard",
+        "Description": f"{card_key.upper()} | " + df["merchant"].astype(str),
+        "Cash Account": selected_cash_account, #Aquí se pone 1170 o 1180 automáticamente
         "Bill Reference": "",
         "Bill Remarks": "",
         "Memo For Check": "",
@@ -121,8 +136,8 @@ def main():
     output_path = "data/clean/appfolio_ras_bulk_bill.csv"
     bulk_bill.to_csv(output_path, index=False, encoding="utf-8-sig")
 
-    print(f"✅ Éxito: {len(bulk_bill)} líneas exportadas.")
-    print(f"📂 Archivo generado: {output_path}")
+    print(f"Éxito: {len(bulk_bill)} líneas exportadas.")
+    print(f"Archivo generado: {output_path}")
 
 if __name__ == "__main__":
     main()
