@@ -1,22 +1,18 @@
 rentify-ai/
 ├── data/
 │   ├── raw/                      # Archivos originales (AppFolio, CSVs sin procesar)
-│   ├── clean/                    # Datos normalizados y listos para embeddings
-│   └── embedded/                 # Vectores generados, listos para Qdrant
+│   ├── clean/                    # Datos normalizados y listos para conciliación
+│   ├── master/                   # Dataset consolidado (statements unificados + allocations finales)
 ├── scripts/
 │   ├── ingestion/                # Scripts para leer, limpiar y preparar datos
-│   │   └── normalize_gl_accounts.py
-│   ├── embedding/               # Scripts que generan embeddings con LM Studio, etc.
-│   │   └── embed_gl_accounts.py
-│   ├── qdrant/                   # Scripts para insertar, consultar o limpiar colecciones
-│   │   └── insert_gl_to_qdrant.py
+│   │   ├── normalize_gl_accounts.py
+│   │   ├── unify_statements.py        # Unificar todos los statements en uno solo
+│   │   └── create_allocations.py      # Crear allocations según reglas de negocio
+│   ├── fuzzy_match/              # Scripts para búsquedas aproximadas y conciliación difusa
+│   │   └── match_transactions.py      # Ejemplo: emparejar movimientos Amex con notas usando fuzzy matching
 │   └── utils/                    # Funciones compartidas (normalización, logging, etc.)
 │       └── text_cleaning.py
-├── flows/
-│   ├── n8n/                      # Exportaciones o documentación de tus flujos
-│   └── diagrams/                 # Visualizaciones de arquitectura o dependencias
-├── logs/
-│   └── ingestion.log             # Logs de ejecución, errores, fallback, etc.
-├── config/
-│   └── qdrant_settings.yaml      # Parámetros de conexión, colecciones, etc.
-└── README.md                     # Documentación del proyecto
+
+
+# Unificar los statement en uno solo
+# Crear los allocations que sean necesario 
