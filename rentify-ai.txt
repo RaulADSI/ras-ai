@@ -20,3 +20,6 @@ rentify-ai/
 ├── config/
 │   └── qdrant_settings.yaml      # Parámetros de conexión, colecciones, etc.
 └── README.md                     # Documentación del proyecto
+
+# Unificar los statement en uno solo
+# Crear los allocations que sean necesario 
