@@ -1,15 +1,15 @@
 import sys
 import os
 import pandas as pd
-from rapidfuzz import process, fuzz
 
 # --- Configuración de Rutas ---
+# Aseguramos que el proyecto sea visible para las importaciones
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, project_root)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-from scripts.fuzzy_match.resolvers import resolve_vendor
-
-GL_DEFAULT = "6435: General Repairs"
+# Importaciones desde resolvers
+from scripts.fuzzy_match.resolvers import resolve_vendor, resolve_property_code, resolve_cash_account
 
 def extract_gl_info(gl_val):
     if pd.isna(gl_val) or str(gl_val).strip() == "":
@@ -18,9 +18,9 @@ def extract_gl_info(gl_val):
     return parts[0], parts[1] if len(parts) > 1 else ""
 
 def main():
-    print("🚀 Iniciando procesamiento Universal (Amex/Citi)...")
-    
-    # 1. DETECCIÓN DE ARCHIVO Y CARGA
+    print("🚀 Iniciando procesamiento Universal (Amex/Citi)")
+
+    # 1. DETECCIÓN DE ARCHIVO
     if os.path.exists("data/clean/normalized_amex.csv"):
         path = "data/clean/normalized_amex.csv"
         card_key = "amex"
@@ -30,73 +30,62 @@ def main():
 
     print(f"💳 Leyendo archivo: {path}")
     df = pd.read_csv(path)
-    
-    # Cargar Reglas y Directorios
+
+    # 2. CARGA DE DIRECTORIOS Y REGLAS
     rules_df = pd.read_excel("data/master/mapping_rules.xlsx", sheet_name="Rules")
     gl_directory = pd.read_csv("data/clean/normalized_gl_accounts.csv")
     vendor_directory = pd.read_csv("data/clean/normalized_vendor_directory.csv")
-    gl_choices = gl_directory["code_raw"].dropna().tolist()
-
-    # 2. CONFIGURAR MAPEOS (EXCEL)
-    # Cash Account (1170 o 1180)
-    cash_master = {str(k).lower().strip(): v for k, v in rules_df[rules_df["Category"] == "Cash"][["Raw_Text (Key)", "Mapped_Value"]].values}
-    selected_cash_account = cash_master.get(card_key, "1150: Operating")
-
-    # Vendors y Properties
-    v_master = {str(k).upper().strip(): v for k, v in rules_df[rules_df["Category"] == "Vendor"][["Raw_Text (Key)", "Mapped_Value"]].values}
-    p_master = {str(k).upper().strip(): v for k, v in rules_df[rules_df["Category"] == "Property"][["Raw_Text (Key)", "Mapped_Value"]].values}
     
-    # GL Hints
-    gl_hints = rules_df[rules_df["Category"] == "Vendor"][["Mapped_Value", "GL_Account_Hint"]].dropna()
-    gl_hints_dict = {str(k).strip(): str(v).strip() for k, v in gl_hints.values}
+    # IMPORTANTE: Usamos el gl_directory como property_directory para resolver códigos como 930/LRMM
+    property_directory = gl_directory.copy() 
+    property_directory = property_directory.rename(columns={'code_raw': 'normalized_property', 'account_name': 'raw_property'})
 
-    # 3. FILTRADO FLEXIBLE PARA ARMANDO
+    # 3. CONFIGURACIÓN DE CUENTA DE EFECTIVO
+    selected_cash_account = resolve_cash_account(card_key, rules_df)
+    if not selected_cash_account:
+        raise ValueError(f"❌ No Cash Account configurado para {card_key}")
+
+    # 4. FILTRADO (Solo para Mastercard/Citi)
     df.columns = df.columns.str.lower()
-    
-    # IMPORTANTE: Para Amex, confiamos en el filtro que ya hizo normalize_statements.py
-    # Si es Citi, aplicamos el filtro de "company == RAS"
     if card_key == "mastercard":
         df = df[df["company"].astype(str).str.upper() == "RAS"].copy()
-    
+
     if df.empty:
-        print(f"⚠️ No hay transacciones para procesar en {path}")
+        print("⚠️ No hay transacciones para procesar.")
         return
 
-    # 4. RESOLUCIÓN
-    df[["prop_hint", "gl_hint"]] = df["gl_account"].apply(lambda x: pd.Series(extract_gl_info(x)))
+    # 5. RESOLUCIÓN DE DATOS
+    # Extraer códigos de propiedad de la columna gl_account del banco
+    df[["prop_hint", "gl_hint"]] = df["gl_account"].apply(
+        lambda x: pd.Series(extract_gl_info(x))
+    )
 
     def get_resolved_vendor(row):
-        desc = str(row.get("merchant", "")).upper().strip()
-        for raw_key, clean_name in v_master.items():
-            if raw_key in desc: return clean_name
-        res, score = resolve_vendor(row, vendor_directory)
-        return res if score >= 70 else desc
+        res, score = resolve_vendor(row, vendor_directory, rules_df)
+        return res
 
     def get_resolved_property(row):
-        hint = str(row.get("prop_hint", "")).upper().strip()
-        if hint in p_master: return p_master[hint]
-        
-        desc = str(row.get("merchant", "")).upper()
-        for k_key, v_name in p_master.items():
-            if k_key in desc: return v_name
-        return f"REVISAR PROP: {hint}"
+        # Resolvemos usando el código (930, LRMM) contra el Master Excel
+        res, score, method = resolve_property_code(row, property_directory, rules_df)
+        return res
 
-    def resolve_final_gl(row):
-        vendor = str(row["resolved_vendor"]).strip()
-        if vendor in gl_hints_dict: return gl_hints_dict[vendor]
+    def get_resolved_gl(row):
+        # Buscamos el GL_Account_Hint en el Excel para el vendor ya resuelto
+        vendor_res = row["resolved_vendor"]
+        hint = rules_df[(rules_df["Category"] == "Vendor") & 
+                        (rules_df["Mapped_Value"] == vendor_res)]["GL_Account_Hint"]
         
-        gl_text = str(row.get("gl_hint", "")).strip()
-        if gl_text:
-            match = process.extractOne(gl_text, gl_choices, scorer=fuzz.WRatio)
-            if match and match[1] >= 75: return match[0]
-        return GL_DEFAULT
+        if not hint.dropna().empty:
+            return str(hint.iloc[0]).strip()
+        
+        return "6435: General Repairs" # Default
 
-    print("Procesando mapeos...")
+    print("🔍 Aplicando mapeos y resolvers...")
     df["resolved_vendor"] = df.apply(get_resolved_vendor, axis=1)
     df["resolved_property"] = df.apply(get_resolved_property, axis=1)
-    df["resolved_gl"] = df.apply(resolve_final_gl, axis=1)
+    df["resolved_gl"] = df.apply(get_resolved_gl, axis=1)
 
-    # 5. CONSTRUIR BULK BILL
+    # 6. EXPORTACIÓN A FORMATO APPFOLIO (BULK BILL)
     bulk_bill = pd.DataFrame({
         "Bill Property Code*": df["resolved_property"],
         "Vendor Payee Name*": df["resolved_vendor"],
@@ -105,7 +94,7 @@ def main():
         "Bill Date*": df["date"],
         "Due Date*": df["date"],
         "Posting Date*": df["date"],
-        "Description": f"{card_key.upper()} | " + df["merchant"].astype(str),
+        "Description": (f"AMEX Payment" if card_key == "amex" else "CITI Payment"),
         "Cash Account": selected_cash_account,
         "Bill Reference": "",
         "Bill Remarks": "",
@@ -116,7 +105,7 @@ def main():
     output_path = "data/clean/appfolio_ras_bulk_bill.csv"
     bulk_bill.to_csv(output_path, index=False, encoding="utf-8-sig")
 
-    print(f"✅ Éxito: {len(bulk_bill)} líneas exportadas.")
+    print(f"✅ Éxito: Exportadas {len(bulk_bill)} líneas.")
     print(f"💰 Total Amount: ${bulk_bill['Amount*'].sum():.2f}")
 
 if __name__ == "__main__":
