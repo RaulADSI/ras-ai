@@ -14,5 +14,5 @@ rentify-ai/
 │       └── text_cleaning.py
 
 
-# Unificar los statement en uno solo
-# Crear los allocations que sean necesario 
+# Crear los allocations que sean necesarios
+#  
