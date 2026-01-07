@@ -4,12 +4,11 @@ import os
 import re
 import glob
 
-# 1. Configurar la ruta raíz del proyecto dinámicamente
+# 1. Configuración dinámica del project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-# 2. Importar utilidades
 from scripts.utils.text_cleaning import normalize_vendor as normalize
 
 # Constantes de limpieza
@@ -30,7 +29,6 @@ def clean_merchant(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 def filter_amex_logic(df: pd.DataFrame) -> pd.DataFrame:
-    """Reglas: Armando siempre pasa. Lindsay/Cory/Ricky solo si es RAS."""
     def check_row(row):
         acc = str(row.get('account_holder', '')).upper()
         comp = str(row.get('company', '')).upper()
@@ -45,12 +43,12 @@ def filter_amex_logic(df: pd.DataFrame) -> pd.DataFrame:
     return df[df['filter_status'] == "RAS"].drop(columns=['filter_status'])
 
 def main():
-    # Carpeta de entrada para múltiples archivos Amex (Lindsay/Ricky)
-    input_folder = "data/raw/pending_amex/"
-    files = glob.glob(os.path.join(input_folder, "*.csv"))
+    input_folder = "data/raw/unify_all_amex/"
+    files = glob.glob(os.path.join(input_folder, "*.csv")) + \
+            glob.glob(os.path.join(input_folder, "*.xlsx"))
 
     if not files:
-        print(f"No se encontraron archivos en {input_folder}")
+        print(f"No files found in {input_folder}")
         return
 
     mapping = {
@@ -60,27 +58,68 @@ def main():
         'Company': 'company', 'GL': 'gl_account'
     }
 
-    combined_list = []
+    combined = []
     for f in files:
-        temp_df = pd.read_csv(f).rename(columns=mapping)
-        combined_list.append(temp_df)
+        if f.lower().endswith(".xlsx"):
+            temp_df = pd.read_excel(f)
+        else:
+            temp_df = pd.read_csv(f)
+        
+        # --- IDENTIFICAR COLUMNA DE ID DE TARJETA (SIN NOMBRE) ---
+        # Si la primera columna no tiene nombre, la llamamos 'card_id'
+        if temp_df.columns[0].startswith('Unnamed'):
+            temp_df = temp_df.rename(columns={temp_df.columns[0]: 'card_id'})
+        
+        temp_df = temp_df.rename(columns=mapping)
+        temp_df['source_file'] = os.path.basename(f)
+        combined.append(temp_df)
 
-    df = pd.concat(combined_list, ignore_index=True)
+    df = pd.concat(combined, ignore_index=True)
 
-    # Limpieza de montos
+    # --- PASO 1: LIMPIEZA DE MONTOS ---
     df['amount'] = (
         df['amount'].astype(str)
         .replace({'\$': '', ',': '', '\(': '-', '\)': ''}, regex=True)
-        .astype(float).abs()
+        .astype(float)
     )
 
-    # Filtrado y Normalización
+    # --- PASO 2: DEDUPLICACIÓN INTELIGENTE (CROSS-FILE) ---
+    # Creamos una huella digital combinando fecha, monto, comercio y el ID de tarjeta (-21062, etc)
+    # Si no existe card_id, usamos el account_holder como respaldo.
+    id_col = 'card_id' if 'card_id' in df.columns else 'account_holder'
+    df['occurrence'] = df.groupby(['source_file', 'date', 'amount', 'merchant', id_col]).cumcount()
+    
+    df['txn_fingerprint'] = (
+        df['date'].astype(str) + 
+        df['amount'].astype(str) + 
+        df['merchant'].astype(str).str[:20] + 
+        df[id_col].astype(str) +
+        df['occurrence'].astype(str)
+    )
+
+    antes = len(df)
+    # Eliminamos duplicados exactos que vienen de archivos diferentes
+    df = df.drop_duplicates(subset=['txn_fingerprint'], keep='first')
+    print(f"Registros duplicados por cruce de archivos eliminados: {antes - len(df)}")
+    df = df.drop(columns=['txn_fingerprint', 'occurrence'])
+
+    # --- PASO 3: FILTRADO DE NEGOCIO ---
     df = filter_amex_logic(df)
+
+    # --- PASO 4: NORMALIZACIÓN ---
     df['normalized_merchant'] = df['merchant'].apply(clean_merchant).apply(normalize)
     
+    # Limpieza final de columnas técnicas
+    if 'txn_fingerprint' in df.columns:
+        df = df.drop(columns=['txn_fingerprint'])
+
+    # --- PASO 5: EXPORTACIÓN ---
     output_path = "data/clean/normalized_amex.csv"
     df.to_csv(output_path, index=False)
-    print(f"Amex consolidado y normalizado: {len(df)} transacciones en {output_path}")
+    
+    print(f"\n--- Reporte Final ---")
+    print(f"Total transacciones únicas: {len(df)}")
+    print(f"Monto Neto Total: ${df['amount'].sum():,.2f}")
 
 if __name__ == "__main__":
     main()

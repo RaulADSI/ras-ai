@@ -15,4 +15,4 @@ rentify-ai/
 
 
 # Crear los allocations que sean necesarios
-#  
+#  Revisar reglas de Ricky
