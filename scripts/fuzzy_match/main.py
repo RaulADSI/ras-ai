@@ -2,87 +2,105 @@ import sys
 import os
 import pandas as pd
 
-# --- Path Configuration ---
+# --- Configuración Dinámica de Rutas ---
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from scripts.fuzzy_match.resolvers import resolve_vendor, resolve_property_code, resolve_cash_account
+from scripts.fuzzy_match.resolvers import (
+    resolve_vendor,
+    resolve_property_code,
+    resolve_cash_account
+)
 
-def extract_gl_info(gl_val):
-    if pd.isna(gl_val) or str(gl_val).strip() == "":
-        return None, None
-    parts = str(gl_val).strip().split(maxsplit=1)
-    return parts[0], parts[1] if len(parts) > 1 else ""
+def apply_richard_rules(row):
+    acc = str(row.get('account_holder', '')).upper()
+    comp = str(row.get('company', '')).upper()
+    gl_hint = str(row.get('gl_account', '')).upper()
+
+    # Defaults
+    status = "OK"
+    note = ""
+
+    # EXCEPTION – prioridad máxima
+    if "RICHARD LIBUTTI" in acc and "HAPPY TRAILERS" in comp:
+        return "EXCEPTION", "Richard Libutti no opera Happy Trailers"
+
+    # ALERT – no degrada EXCEPTION
+    if "RR REITER REALTY" in comp:
+        if "RAS" not in gl_hint and "RAS" not in comp:
+            return "ALERT", "RR Reiter pagado sin marca RAS"
+
+    return status, note
+
 
 def main():
-    print("Starting Universal Processing (Amex/Citi)")
+    print("Iniciando procesamiento con neteo y Reglas Libutti/Armas")
 
-    # 1. FILE DETECTION
     jobs = []
     if os.path.exists("data/clean/normalized_amex.csv"):
         jobs.append(("data/clean/normalized_amex.csv", "amex"))
-    
     if os.path.exists("data/clean/normalized_citi.csv"):
         jobs.append(("data/clean/normalized_citi.csv", "mastercard"))
 
     if not jobs:
-        print("No normalized files found in data/clean/")
+        print("No se encontraron archivos de entrada.")
         return
 
-    # 2. LOAD DIRECTORIES AND RULES (Se cargan una sola vez)
+    # Carga de catálogos
     rules_df = pd.read_excel("data/master/mapping_rules.xlsx", sheet_name="Rules")
     gl_directory = pd.read_csv("data/clean/normalized_gl_accounts.csv")
     vendor_directory = pd.read_csv("data/clean/normalized_vendor_directory.csv")
-    
-    property_directory = gl_directory.copy() 
-    property_directory = property_directory.rename(columns={'code_raw': 'normalized_property', 'account_name': 'raw_property'})
+    prop_dir = gl_directory.rename(columns={"code_raw": "normalized_property", "account_name": "raw_property"})
 
-    all_bills = []
-
-    # 3. PROCESSING LOOP (Todo el procesamiento debe estar DENTRO del for)
     for path, card_key in jobs:
-        print(f"Processing {card_key.upper()} from: {path}")
-        df = pd.read_csv(path)
+        print(f"\nProcesando {card_key.upper()} → {path}")
 
-        # Configuración de cuenta de efectivo
-        selected_cash_account = resolve_cash_account(card_key, rules_df)
-        if not selected_cash_account:
-            print(f"Skipping {card_key}: No Cash Account configured.")
-            continue
-
-        # Filtrado específico (Solo para Citi)
-        df.columns = df.columns.str.lower()
-        if card_key == "mastercard":
-            df = df[df["company"].astype(str).str.upper() == "RAS"].copy()
-
-        if df.empty:
-            print(f"ℹNo transactions to process for {card_key}.")
-            continue
-        
         df = pd.read_csv(path)
         df.columns = df.columns.str.lower()
 
-        # 1. Aplicar filtro (IMPORTANTE: No volver a leer el CSV después de esto)
-        if card_key == "mastercard":
-            df = df[df["company"].astype(str).str.upper() == "RAS"].copy()
-
-        if df.empty:
-            print(f"ℹ No transactions to process for {card_key}.")
-            continue
-
-        # 2. Asegurar que existe la columna gl_account
-        if "gl_account" not in df.columns:
-            df["gl_account"] = ""
-            
-        # Resolución de datos
-        df[["prop_hint", "gl_hint"]] = df["gl_account"].apply(
-            lambda x: pd.Series(extract_gl_info(x))
+        # --- APLICAR REGLAS DE RICHARD LIBUTTI ---
+        df[['validation_status', 'validation_note']] = df.apply(
+        lambda r: pd.Series(apply_richard_rules(r)),
+        axis=1
         )
 
-        print(f"Applying resolvers for {card_key}...")
+        
+        # Reportar alertas en consola antes de filtrar
+        alerts = df[df['validation_status'] != "OK"]
+        if not alerts.empty:
+            print(f"Se encontraron {len(alerts)} inconsistencias de negocio (Excepciones/Alertas).")
+
+        # IMPORTANTE:
+        # No filtrar por company == 'RAS'.
+        # La validez de la transacción se determina por validation_status,
+        # no por el texto del statement.
+
+        df = df[
+        df["validation_status"].isin(["OK", "ALERT"])
+        ].copy()
+
+
+        if df.empty:
+            print(f"Sin transacciones RAS para {card_key}.")
+            continue
+
+        # Resolución de Vendor y Propiedad (Fuzzy Match)
         df["resolved_vendor"] = df.apply(lambda r: resolve_vendor(r, vendor_directory, rules_df)[0], axis=1)
-        df["resolved_property"] = df.apply(lambda r: resolve_property_code(r, property_directory, rules_df)[0], axis=1)
+        df["resolved_property"] = df.apply(lambda r: resolve_property_code(r, prop_dir, rules_df)[0], axis=1)
+
+        # --- LÓGICA DE NETEO ---
+        df["abs_amount"] = df["amount"].abs().round(2)
+        group_cols = ["date", "merchant", "resolved_vendor", "resolved_property", "abs_amount", "validation_status"]
+
+        df_netted = (
+            df.groupby(group_cols, as_index=False)
+            .agg({"amount": "sum", "validation_note" : "first"})
+        )
+        df_netted = df_netted[df_netted["amount"].round(2) != 0].copy()
+
+        # Resolución de Cash Account y GL
+        selected_cash_account = resolve_cash_account(card_key, rules_df)
         
         def get_resolved_gl(row):
             vendor_res = row["resolved_vendor"]
@@ -90,37 +108,36 @@ def main():
                             (rules_df["Mapped_Value"] == vendor_res)]["GL_Account_Hint"]
             return str(hint.iloc[0]).strip() if not hint.dropna().empty else "6435: General Repairs"
 
-        df["resolved_gl"] = df.apply(get_resolved_gl, axis=1)
-
-        # Crear DataFrame temporal para esta tarjeta
-        temp_bill = pd.DataFrame({
-            "Bill Property Code*": df["resolved_property"],
-            "Vendor Payee Name*": df["resolved_vendor"],
-            "Amount*": df["amount"],
-            "Bill Account*": df["resolved_gl"],
-            "Bill Date*": df["date"],
-            "Due Date*": df["date"],
-            "Posting Date*": df["date"],
-            "Description": (f"AMEX Payment | " if card_key == "amex" else "CITI Payment | ") + df["merchant"].astype(str),
+        # 4. Construcción del DataFrame para AppFolio
+        final_df = pd.DataFrame({
+            "Bill Property Code*": df_netted["resolved_property"],
+            "Vendor Payee Name*": df_netted["resolved_vendor"],
+            "Amount*": df_netted["amount"],
+            "Bill Account*": df_netted.apply(get_resolved_gl, axis=1),
+            "Bill Date*": df_netted["date"],
+            "Due Date*": df_netted["date"],
+            "Posting Date*": df_netted["date"],
+            "Description": (
+                f"{card_key.upper()} | "
+                + df_netted["merchant"].astype(str)
+                + " | "
+                + df_netted["validation_status"]
+                + " - "
+                + df_netted["validation_note"]
+        ),
             "Cash Account": selected_cash_account
         })
-        all_bills.append(temp_bill)
 
-    # 4. CONSOLIDATION AND EXPORT
-    if all_bills:
-        final_bulk_bill = pd.concat(all_bills, ignore_index=True)
-        
-        # Columnas requeridas por AppFolio
         for col in ["Bill Reference", "Bill Remarks", "Memo For Check", "Purchase Order Number"]:
-            final_bulk_bill[col] = ""
+            final_df[col] = ""
 
-        output_path = "data/clean/appfolio_ras_bulk_bill.csv"
-        final_bulk_bill.to_csv(output_path, index=False, encoding="utf-8-sig")
+        # 5. Exportación
+        output_path = f"data/clean/appfolio_ras_bulk_bill_{card_key}.csv"
+        final_df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
-        print(f"Success: Exported {len(final_bulk_bill)} total lines.")
-        print(f"Total Consolidated Amount: ${final_bulk_bill['Amount*'].sum():.2f}")
-    else:
-        print("No data was processed.")
+        print(f"Total Bruto:   ${df['amount'].sum():,.2f}")
+        print(f"Total Neteado: ${final_df['Amount*'].sum():,.2f}")
+        print(f"Archivo: {output_path}")
 
 if __name__ == "__main__":
     main()
