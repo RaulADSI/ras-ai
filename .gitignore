@@ -34,3 +34,7 @@ venv/
 .env/
 .envrc
 .venv/
+
+#Token files
+token.json
+credentials.json

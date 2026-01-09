@@ -13,7 +13,7 @@ from scripts.utils.text_cleaning import normalize_vendor as normalize
 
 # --------------------------------------------------
 # CONSTANTES Y LIMPIEZA
-# --------------------------------------------------
+
 DEFAULT_CITIES = ['MIAMI', 'HIALEAH', 'OPA LOCKA', 'NORTH MIAMI', 'CORAL GABLES', 'SUNRISE', 'DAVIE', 'FORT LAUDERDALE', 'HOLLYWOOD', 'MIAMI BEACH', 'WESTON', 'POMPANO BEACH', 'LAUDERDALE', 'KENDALL', 'DORAL']
 SORTED_DEFAULT_CITIES = sorted(set(c.upper() for c in DEFAULT_CITIES), key=lambda x: -len(x))
 
@@ -44,7 +44,7 @@ def apply_business_rules(df: pd.DataFrame) -> pd.DataFrame:
 
         # --------------------------------------------------
         # 1. EXCEPCIÓN CRÍTICA (máxima prioridad)
-        # --------------------------------------------------
+        # ------------------------------------------------- 
         if is_richard and "HAPPY TRAILERS" in comp:
             status = "EXCEPTION"
             notes.append("Error: Richard Libutti no opera Happy Trailers")
