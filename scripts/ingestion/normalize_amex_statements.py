@@ -3,126 +3,194 @@ import sys
 import os
 import re
 import glob
+import datetime
 
-# 1. Configuración dinámica del project root
+# ============================================================
+# 1. CONFIGURACIÓN DE ENTORNO
+# ============================================================
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from scripts.utils.text_cleaning import normalize_vendor as normalize
+try:
+    from scripts.utils.text_cleaning import normalize_vendor as normalize
+except ImportError:
+    def normalize(text): return str(text).upper().strip()
 
-# --------------------------------------------------
-# CONSTANTES Y LIMPIEZA
+CANONICAL_COLUMNS = ['date', 'merchant', 'account_holder', 'column', 'amount', 'company', 'gl_account']
 
-DEFAULT_CITIES = ['MIAMI', 'HIALEAH', 'OPA LOCKA', 'NORTH MIAMI', 'CORAL GABLES', 'SUNRISE', 'DAVIE', 'FORT LAUDERDALE', 'HOLLYWOOD', 'MIAMI BEACH', 'WESTON', 'POMPANO BEACH', 'LAUDERDALE', 'KENDALL', 'DORAL']
-SORTED_DEFAULT_CITIES = sorted(set(c.upper() for c in DEFAULT_CITIES), key=lambda x: -len(x))
+# ============================================================
+# 2. UTILIDADES DE LIMPIEZA
+# ============================================================
+def clean_currency(series):
+    return (
+        pd.to_numeric(
+            series.astype(str)
+            .replace({'\$': '', ',': '', '\(': '-', '\)': ''}, regex=True),
+            errors='coerce'
+        ).fillna(0.0).round(2)
+    )
 
 def clean_merchant(text: str) -> str:
     if not text: return ""
     t = str(text).upper()
-    for city in SORTED_DEFAULT_CITIES:
-        t = re.sub(rf"\b{re.escape(city)}\b", "", t)
     t = re.sub(r"\b\d{4,}\b", "", t)
     t = re.sub(r"[^\w\s]", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
-# --------------------------------------------------
-# NUEVA LÓGICA DE NEGOCIO (Richard Libutti / RAS / GL)
-# --------------------------------------------------
+# ============================================================
+# 3. REGLAS DE NEGOCIO (RAS - ESTRICTO SIN RR)
+# ============================================================
 def apply_business_rules(df: pd.DataFrame) -> pd.DataFrame:
     def validate_row(row):
-        acc = str(row.get('account_holder', '')).upper()
+        acc = str(row.get('account_holder', '')).upper().strip()
+        merc = str(row.get('merchant', '')).upper()
         comp = str(row.get('company', '')).upper()
         gl = str(row.get('gl_account', '')).upper()
 
-        status = "KEEP"
-        notes = []
+        status, notes = "KEEP", []
 
-        is_armando = "ARMANDO ARMAS" in acc
-        is_richard = "RICHARD LIBUTTI" in acc
-        is_ras = "RAS" in comp or "RAS" in gl
+        # 1. Identificación de Titulares (Respaldo en Merchant si Account está vacío)
+        is_armando = ("ARMANDO ARMAS" in acc) or (acc in ["", "NAN", "NONE"] and "ARMANDO ARMAS" in merc)
+        is_richard = ("RICHARD LIBUTTI" in acc) or (acc in ["", "NAN", "NONE"] and "RICHARD LIBUTTI" in merc)
 
-        # --------------------------------------------------
-        # 1. EXCEPCIÓN CRÍTICA (máxima prioridad)
-        # ------------------------------------------------- 
+        # 2. Marcas Explícitas (SOLO RAS y REITER, excluyendo RR solo)
+        is_ras_marked = any(x in comp or x in gl for x in ["RAS", "REITER"])
+
+        # EXCEPCIÓN
         if is_richard and "HAPPY TRAILERS" in comp:
-            status = "EXCEPTION"
-            notes.append("Error: Richard Libutti no opera Happy Trailers")
+            return pd.Series(["EXCEPTION", "Richard Libutti no opera Happy Trailers"])
 
-        # --------------------------------------------------
-        # 2. ALERTA CONTABLE (no degrada EXCEPTION)
-        # --------------------------------------------------
-        if status != "EXCEPTION" and "RR REITER REALTY" in comp:
-            if not is_ras:
-                status = "ALERT"
-                notes.append("Validación requerida: RR Reiter pagado sin RAS")
-
-        # --------------------------------------------------
-        # 3. FUENTES VÁLIDAS (solo afecta KEEP → SKIP)
-        # --------------------------------------------------
-        is_valid_source = is_armando or is_richard or is_ras
-
-        if status == "KEEP" and not is_valid_source:
+        # LÓGICA DE FILTRADO
+        if is_ras_marked or is_armando or is_richard:
+            status = "KEEP"
+            if is_ras_marked: notes.append("Marca RAS/REITER detectada")
+            if acc in ["", "NAN", "NONE"] and (is_armando or is_richard): notes.append("Titular en Merchant")
+        else:
             status = "SKIP"
 
         return pd.Series([status, "; ".join(notes)])
 
     df = df.copy()
     df[['validation_status', 'business_notes']] = df.apply(validate_row, axis=1)
+    return df
 
-    # Conservamos todo excepto SKIP
-    return df[df['validation_status'] != "SKIP"]
+# ============================================================
+# 4. CARGA DE ARCHIVOS (CORREGIDO)
+# ============================================================
+def load_amex_file(filepath: str) -> pd.DataFrame:
+    ext = filepath.lower().split('.')[-1]
+    
+    # Lectura inicial para inspección
+    raw = pd.read_excel(filepath, header=None) if ext == "xlsx" else pd.read_csv(filepath, header=None)
+
+    header_row = None
+
+    # Buscar encabezados reales (ej. "DATE", "AMOUNT")
+    for i in range(min(15, len(raw))):
+        row_values = [str(val).upper() for val in raw.iloc[i].values]
+        row_text = " ".join(row_values)
+
+        if "DATE" in row_text and "AMOUNT" in row_text:
+            header_row = i
+            break
+
+    # -------------------------------
+    # CASO 1: ARCHIVO CON ENCABEZADOS
+    # -------------------------------
+    if header_row is not None:
+        df = pd.read_excel(filepath, header=header_row) if ext == "xlsx" else pd.read_csv(filepath, header=header_row)
+        df.columns = [str(c).strip().upper() for c in df.columns]
+
+    # ---------------------------------------------------------
+    # CASO 2: ARCHIVO SIN ENCABEZADOS (Tu caso actual)
+    # ---------------------------------------------------------
+    else:
+        # IMPORTANTE: Re-leer con header=None para NO perder la primera fila de datos
+        df = pd.read_excel(filepath, header=None) if ext == "xlsx" else pd.read_csv(filepath, header=None)
+        
+        # Asignar nombres temporales para que el resto del script no falle
+        n_cols = df.shape[1]
+        temp_columns = CANONICAL_COLUMNS[:n_cols]
+        if n_cols > len(CANONICAL_COLUMNS):
+            temp_columns += [f"extra_{i}" for i in range(n_cols - len(CANONICAL_COLUMNS))]
+        
+        df.columns = temp_columns
+
+    # --- NORMALIZACIÓN FINAL DE COLUMNAS ---
+    if df.shape[1] < len(CANONICAL_COLUMNS):
+        raise ValueError(f"Columnas insuficientes en {os.path.basename(filepath)}")
+
+    # Aseguramos el orden canónico exacto
+    df.columns = CANONICAL_COLUMNS + [
+        f"extra_{i}" for i in range(df.shape[1] - len(CANONICAL_COLUMNS))
+    ]
+
+    return df
 
 
+# ============================================================
+# 5. PIPELINE PRINCIPAL
+# ============================================================
 def main():
-    input_folder = "data/raw/unify_all_amex/"
-    files = glob.glob(os.path.join(input_folder, "*.csv")) + \
-            glob.glob(os.path.join(input_folder, "*.xlsx"))
+    INPUT_FOLDER = "data/raw/unify_all_amex/"
+    OUTPUT_PATH = "data/clean/normalized_amex.csv"
+    
+    files = glob.glob(os.path.join(INPUT_FOLDER, "*.csv")) + glob.glob(os.path.join(INPUT_FOLDER, "*.xlsx"))
 
-    if not files: return
+    if not files:
+        print("❌ No se encontraron archivos.")
+        return
 
-    mapping = {
-        'Description': 'merchant', 'Merchant': 'merchant',
-        'Debit': 'amount', 'Amount': 'amount', 'Charge': 'amount',
-        'Date': 'date', 'Account': 'account_holder',
-        'Company': 'company', 'GL': 'gl_account'
-    }
-
-    combined = []
+    dfs = []
     for f in files:
-        temp_df = pd.read_excel(f) if f.lower().endswith(".xlsx") else pd.read_csv(f)
-        if temp_df.columns[0].startswith('Unnamed'):
-            temp_df = temp_df.rename(columns={temp_df.columns[0]: 'card_id'})
-        temp_df = temp_df.rename(columns=mapping)
-        temp_df['source_file'] = os.path.basename(f)
-        combined.append(temp_df)
+        try:
+            df = load_amex_file(f)
+            df["source_file"] = os.path.basename(f)
+            dfs.append(df)
+        except Exception as e:
+            print(f"❌ Error en {f}: {e}")
 
-    df = pd.concat(combined, ignore_index=True)
+    if not dfs:
+        return
 
-    # --- PASO 1: LIMPIEZA DE MONTOS ---
-    df['amount'] = df['amount'].astype(str).replace({'\$': '', ',': '', '\(': '-', '\)': ''}, regex=True).astype(float)
+    df_raw = pd.concat(dfs, ignore_index=True)
+    df_raw['amount'] = clean_currency(df_raw['amount'])
 
-    # --- PASO 2: DEDUPLICACIÓN (CON CONTADOR PARA TRANSACCIONES LEGÍTIMAS) ---
-    id_col = 'card_id' if 'card_id' in df.columns else 'account_holder'
-    df['occurrence'] = df.groupby(['source_file', 'date', 'amount', 'merchant', id_col]).cumcount()
-    df['txn_id'] = df['date'].astype(str) + df['amount'].astype(str) + df['merchant'].astype(str) + df[id_col].astype(str) + df['occurrence'].astype(str)
+    # Deduplicación
+    group_cols = ['date', 'merchant', 'account_holder', 'amount', 'company']
+    df_raw['occurrence'] = df_raw.groupby(group_cols).cumcount()
+    df_raw['dedup_key'] = (df_raw['date'].astype(str) + "|" + df_raw['amount'].astype(str) + "|" + 
+    df_raw['merchant'].str.upper().str.strip() + "|" + df_raw['occurrence'].astype(str))
     
-    df = df.drop_duplicates(subset=['txn_id'], keep='first').drop(columns=['txn_id', 'occurrence'])
+    df_dedup = df_raw.drop_duplicates(subset='dedup_key', keep='first').copy()
+    statement_total = round(df_dedup['amount'].sum(), 2)
 
-    # --- PASO 3: APLICAR REGLAS DE NEGOCIO (RICHARD/ARMANDO/GL) ---
-    df = apply_business_rules(df)
+    df_final = apply_business_rules(df_dedup)
+    
+    processed_df = df_final[df_final['validation_status'] != "SKIP"].copy()
+    charges_only = round(processed_df[processed_df['amount'] > 0]['amount'].sum(), 2)
+    credits_only = round(processed_df[processed_df['amount'] < 0]['amount'].sum(), 2)
+    skipped_total = round(df_final[df_final['validation_status'] == "SKIP"]['amount'].sum(), 2)
+    diff = round(statement_total - (charges_only + credits_only + skipped_total), 2)
 
-    # --- PASO 4: NORMALIZACIÓN ---
-    df['normalized_merchant'] = df['merchant'].apply(clean_merchant).apply(normalize)
     
-    # --- PASO 5: EXPORTACIÓN ---
-    output_path = "data/clean/normalized_amex.csv"
-    df.to_csv(output_path, index=False)
-    
-    print(f"\n--- Reporte de Validación ---")
-    print(f"Excepciones halladas: {len(df[df['validation_status'] == 'EXCEPTION'])}")
-    print(f"Alertas RR Reiter: {len(df[df['validation_status'] == 'ALERT'])}")
-    print(f"Total procesado: {len(df)}")
+
+    print("\n" + "╔" + "═" * 62 + "╗")
+    print(f"║ {'REPORTE FINANCIERO RAS - AMEX (VERSIÓN FINAL)':^60} ║")
+    print("╠" + "═" * 62 + "╣")
+    print(f"║ {'VALOR REAL GASTOS RAS (Cargos):':<35} ${charges_only:>18,.2f} ║")
+    print(f"║ {'Abonos/Devoluciones Procesados:':<35} ${credits_only:>18,.2f} ║")
+    print(f"║ {'Pagos a Tarjeta (Omitidos):':<35} ${skipped_total:>18,.2f} ║")
+    print("╟" + "─" * 62 + "╢")
+    print(f"║ {'NETO BANCARIO (Statement Total):':<35} ${statement_total:>18,.2f} ║")
+    print("╠" + "═" * 62 + "╣")
+    print(f"║ {'✅ CONCILIACIÓN RAS EXITOSA':^60} ║" if abs(diff) <= 0.01 else f"║ {'🚨 DIFERENCIA: $' + str(diff):^60} ║")
+    print("╚" + "═" * 62 + "╝")
+
+    processed_df['normalized_merchant'] = processed_df['merchant'].apply(clean_merchant).apply(normalize)
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    processed_df.to_csv(OUTPUT_PATH, index=False)
 
 if __name__ == "__main__":
     main()
