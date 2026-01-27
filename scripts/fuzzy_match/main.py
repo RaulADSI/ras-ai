@@ -125,7 +125,19 @@ def main():
             "Description": f"{card_key.upper()} | {df_netted['merchant']} | {df_netted['validation_status']} {df_netted['validation_note']}".strip(),
             "Cash Account": selected_cash_account
         })
-
+        
+        final_df["Description"] = (
+            card_key.upper()
+            + " | "
+            + df_netted["merchant"].astype(str)
+            + " | "
+            + df_netted["validation_status"].astype(str)
+            + " "
+            + df_netted["validation_note"].fillna("").astype(str)
+        )
+        assert len(final_df) == len(df_netted), "Mismatch entre df_netted y final_df"
+        assert not final_df["Description"].str.contains("dtype:", na=False).any()
+        
         output_path = f"data/clean/appfolio_ras_bulk_bill_{card_key}.csv"
         final_df.to_csv(output_path, index=False, encoding="utf-8-sig")
         
