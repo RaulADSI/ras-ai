@@ -13,7 +13,7 @@ if project_root not in sys.path:
 
 CANONICAL_COLUMNS = ['date', 'merchant', 'account_holder', 'column', 'amount', 'company', 'gl_account']
 
-RULES_FILE = "data/config/mapping_rules.xlsx"
+RULES_FILE = "data/master/mapping_rules.xlsx"
 
 # ============================================================
 # 2. UTILIDADES
@@ -39,22 +39,43 @@ def clean_merchant(text):
 # 3. MAPPING RULES (FUENTE DE VERDAD)
 # ============================================================
 def load_mapping_rules():
-    rules = (
-        pd.read_excel(RULES_FILE, sheet_name="merchant_rules")
-        .dropna(subset=["match_pattern"])
-        .sort_values("priority", ascending=False)
-    )
+    rules = pd.read_excel(RULES_FILE, sheet_name="Rules")
+
+    rules = rules.rename(columns={
+        "Raw_Text (Key)": "match_pattern",
+        "Mapped_Value": "normalized_merchant",
+        "Category": "vendor_class",
+        "GL_Account_Hint": "gl_hint",
+    })
+
+    rules = rules.dropna(subset=["match_pattern"])
+
+    # NUEVO: Si no existe la columna 'priority' en el Excel, la creamos con valor 10
+    if "priority" not in rules.columns:
+        rules["priority"] = 10
+
+    rules = rules.sort_values("priority", ascending=False)
     rules["match_pattern"] = rules["match_pattern"].str.lower()
     return rules
 
 def apply_mapping_rules(merchant, rules_df):
     m = str(merchant).lower()
-    for _, r in rules_df.iterrows():
-        if pd.Series(m).str.contains(r["match_pattern"], regex=True, na=False).iloc[0]:
-            return pd.Series({
-                "normalized_merchant": r["normalized_merchant"],
-                "vendor_class": r["vendor_class"]
-            })
+
+    for r in rules_df.itertuples():
+        # 1. Forzamos que la regla sea sí o sí un texto (string)
+        pattern = str(r.match_pattern)
+        
+        # 2. Le ponemos un escudo (try) por si la regla tiene símbolos raros como '*'
+        try:
+            if re.search(pattern, m):
+                return pd.Series({
+                    "normalized_merchant": r.normalized_merchant,
+                    "vendor_class": r.vendor_class
+                })
+        except re.error:
+            # Si la regla en el Excel tiene un error de formato, la ignora y sigue
+            continue
+
     return pd.Series({
         "normalized_merchant": clean_merchant(merchant),
         "vendor_class": "UNCLASSIFIED"
@@ -145,19 +166,20 @@ def main():
     amex = apply_business_rules(amex)
     amex = amex[amex["validation_status"] != "SKIP"].copy()
 
-    # 🔥 NORMALIZACIÓN CENTRALIZADA
-    mapped = amex["merchant"].apply(lambda x: apply_mapping_rules(x, rules))
-    amex["normalized_merchant"] = mapped["normalized_merchant"]
-    amex["vendor_class"] = mapped["vendor_class"]
+    # NORMALIZACIÓN CENTRALIZADA
+    
+    mapped_df = amex["merchant"].apply(lambda x: apply_mapping_rules(x, rules))
+    # Simplemente pegamos estas nuevas columnas a nuestro archivo original
+    amex = pd.concat([amex, mapped_df], axis=1)
 
     # Auditoría
     unclassified = (amex["vendor_class"] == "UNCLASSIFIED").sum()
     if unclassified:
-        print(f"⚠️ {unclassified} merchants sin clasificar (revisar mapping_rules.xlsx)")
+        print(f" {unclassified} merchants sin clasificar (revisar mapping_rules.xlsx)")
 
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     amex.to_csv(OUTPUT_PATH, index=False)
-    print(f"✅ Archivo generado: {OUTPUT_PATH}")
+    print(f" Archivo generado: {OUTPUT_PATH}")
 
 if __name__ == "__main__":
     main()

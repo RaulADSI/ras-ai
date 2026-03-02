@@ -1,5 +1,5 @@
 import pandas as pd
-from datetime import timedelta
+import re
 import os
 
 # ============================================================
@@ -35,33 +35,22 @@ else:
 
 
 def apply_mapping_rules(merchant_raw, rules_df):
-    if rules_df is None:
-        return pd.Series({
-            "vendor": str(merchant_raw).upper(),
-            "class": "UNCLASSIFIED",
-            "gl_hint": ""
-        })
+    if rules_df is None or pd.isna(merchant_raw):
+        return pd.Series({"vendor": str(merchant_raw).upper(), "class": "UNCLASSIFIED", "gl_hint": ""})
 
     m = str(merchant_raw).lower()
     for _, r in rules_df.iterrows():
         pattern = str(r["match_pattern"])
-        if not pattern or pattern == "nan":
-            continue
+        if pattern == "nan": continue
+        
+        # Uso de re.search en lugar de pd.Series().str.contains()
         try:
-            if pd.Series(m).str.contains(pattern, regex=True, na=False).iloc[0]:
-                return pd.Series({
-                    "vendor": r["normalized_merchant"],
-                    "class": r["vendor_class"],
-                    "gl_hint": r.get("gl_hint", "")
-                })
-        except Exception:
+            if re.search(pattern, m): 
+                return pd.Series({"vendor": r["normalized_merchant"], "class": r["vendor_class"], "gl_hint": r.get("gl_hint", "")})
+        except re.error:
             continue
-
-    return pd.Series({
-        "vendor": str(merchant_raw).upper(),
-        "class": "UNCLASSIFIED",
-        "gl_hint": ""
-    })
+            
+    return pd.Series({"vendor": str(merchant_raw).upper(), "class": "UNCLASSIFIED", "gl_hint": ""})
 
 
 # ============================================================
@@ -70,14 +59,13 @@ def apply_mapping_rules(merchant_raw, rules_df):
 amex = pd.read_csv(AMEX_FILE, parse_dates=["date"])
 ledger = pd.read_csv(VENDOR_LEDGER)
 
-print("🔍 Aplicando mapeo y clasificación...")
+print(" Aplicando mapeo y clasificación...")
 amex = pd.concat(
     [amex, amex["merchant"].apply(lambda x: apply_mapping_rules(x, rules))],
     axis=1
 )
 
 ledger.columns = ledger.columns.str.strip().str.lower()
-
 
 def safe_clean_currency(df, col):
     if col not in df.columns:
@@ -91,7 +79,6 @@ def safe_clean_currency(df, col):
         .round(2)
     )
 
-
 ledger["bill_date_clean"] = pd.to_datetime(ledger.get("bill date"), errors="coerce")
 ledger["desc_clean"] = ledger.get("description", "").astype(str).str.upper()
 ledger["amount_clean"] = safe_clean_currency(ledger, "amount")
@@ -103,66 +90,72 @@ if "vendor" not in ledger.columns:
         "description"
     )
     ledger["vendor"] = ledger[fallback]
-    print(f"⚠️ Columna vendor no encontrada, usando '{fallback}'")
+    print(f"Columna vendor no encontrada, usando '{fallback}'")
 
 
 # ============================================================
 # 4. FUNCIÓN CORE — LEDGER COMO FUENTE DE VERDAD
 # ============================================================
-def remove_amex_using_ledger_unpaid(
+def remove_amex_using_ledger_unpaid_exact(
     ledger_df: pd.DataFrame,
     amex_df: pd.DataFrame,
     vendor_key: str,
+    amount_tolerance: float = 0.01
 ):
     """
-    Elimina cargos AMEX hasta consumir exactamente el saldo unpaid del Ledger.
-    Nunca elimina más de lo que el Ledger respalda.
+    Elimina cargos AMEX buscando coincidencias exactas de monto con las facturas pendientes
+    en el Ledger (1-to-1 match).
     """
-
     ledger = ledger_df.copy()
     amex = amex_df.copy()
 
+    # 1. Identificar facturas del proveedor en el Ledger
     vendor_mask = (
         ledger["vendor"].astype(str).str.upper().str.contains(vendor_key, na=False)
         | ledger["desc_clean"].str.contains(vendor_key, na=False)
-        | ledger.get("gl account", "")
-            .astype(str)
-            .str.contains("6435", na=False)
+        # Opcional: | ledger.get("gl account", "").astype(str).str.contains("6435", na=False)
     )
 
     bills = ledger[vendor_mask & (ledger["unpaid_clean"] > 0)]
+    
+    # Extraemos la lista de montos pendientes y los ordenamos (opcional, ayuda a procesar grandes primero)
+    unpaid_amounts = bills["unpaid_clean"].sort_values(ascending=False).tolist()
 
-    ledger_truth_total = bills["unpaid_clean"].sum()
-
-    if ledger_truth_total <= 0:
-        print(f"⚠️ No se encontró deuda para {vendor_key}")
+    if not unpaid_amounts:
+        print(f"No se encontró deuda pendiente para {vendor_key} en el Ledger.")
         return set(), 0.0
 
-    amex_vendor = (
-        amex[amex["vendor"].str.upper().str.contains(vendor_key, na=False)]
-        .sort_values("date")
-    )
-
+    # 2. Aislar transacciones AMEX del proveedor
+    amex_vendor = amex[amex["vendor"].str.upper().str.contains(vendor_key, na=False)]
+    
     to_remove = set()
-    remaining = ledger_truth_total
+    matched_ledger_total = 0.0
 
-    for idx, row in amex_vendor.iterrows():
-        if remaining <= 0.009:
-            break
+    # 3. Lógica de Emparejamiento Exacto (1-to-1)
+    for bill_amount in unpaid_amounts:
+        # Buscar cargos AMEX que:
+        # - No hayan sido emparejados previamente (~isin(to_remove))
+        # - El monto coincida con el bill_amount (+/- tolerancia)
+        potential_matches = amex_vendor[
+            (~amex_vendor.index.isin(to_remove)) & 
+            (abs(amex_vendor["amount"] - bill_amount) <= amount_tolerance)
+        ].sort_values("date") # Ordenar por fecha para tomar el cargo más antiguo en caso de empates
 
-        if row["amount"] <= remaining + 0.01:
-            to_remove.add(idx)
-            remaining -= row["amount"]
+        if not potential_matches.empty:
+            # ¡Match encontrado! Tomamos el índice del cargo AMEX más antiguo que encaja
+            match_idx = potential_matches.index[0]
+            to_remove.add(match_idx)
+            matched_ledger_total += bill_amount
 
-    return to_remove, ledger_truth_total
+    return to_remove, matched_ledger_total
 
 
 # ============================================================
 # 5. DEDUPLICACIÓN ACE
 # ============================================================
-print("\n🔎 Ejecutando deduplicación ACE (Ledger-driven)...")
+print("\n Ejecutando deduplicación ACE (Ledger-driven)...")
 
-to_remove, ledger_total = remove_amex_using_ledger_unpaid(
+to_remove, ledger_total = remove_amex_using_ledger_unpaid_exact(
     ledger_df=ledger,
     amex_df=amex,
     vendor_key="ACE"
