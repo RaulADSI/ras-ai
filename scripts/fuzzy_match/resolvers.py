@@ -20,9 +20,8 @@ def apply_rules(name: str, rules_df: pd.DataFrame, category: str) -> str | None:
 
 def resolve_property_code(row, property_directory, rules_df, score_cutoff=75):
     """
-    Resuelve la propiedad usando el código (930, LRMM) o el merchant.
+    Resuelve la propiedad usando el prop_hint (columna 7).
     """
-    # Intentar primero con la pista del GL (ej. '930') extraída en el main
     prop_hint = str(row.get("prop_hint", "")).upper().strip()
     
     # Prioridad 1: Mapeo directo de código en Excel (ej. '930' -> Dirección larga)
@@ -30,22 +29,8 @@ def resolve_property_code(row, property_directory, rules_df, score_cutoff=75):
     if direct_match:
         return direct_match, 100, "excel_mapping"
 
-    # Prioridad 2: Buscar si el merchant contiene el nombre de la propiedad
-    merchant = str(row.get("merchant", "")).upper()
-    merchant_match = apply_rules(merchant, rules_df, "Property")
-    if merchant_match:
-        return merchant_match, 100, "excel_mapping"
-
-    # Fallback: Fuzzy match contra directorio
-    choices = property_directory["normalized_property"].dropna().astype(str).tolist()
-    match, score = get_best_match(merchant, choices, score_cutoff=score_cutoff)
-    
-    if match:
-        raw_match = property_directory.loc[
-            property_directory["normalized_property"] == match, "raw_property"
-        ].iloc[0]
-        return raw_match, score, "fuzzy"
-    
+    # Fallback: Si no hay match directo en el Excel, devolvemos una alerta clara
+    # para que un humano lo asigne en el CSV final.
     return f"REVISAR PROP: {prop_hint}", 0, "unresolved"
 
 def resolve_vendor(row, vendor_directory, rules_df, score_cutoff=67):

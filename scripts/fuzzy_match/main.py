@@ -35,19 +35,45 @@ def write_error_log(df_errors):
     file_exists = os.path.isfile(log_filename)
     df_errors.to_csv(log_filename, mode='a', index=False, header=not file_exists, encoding="utf-8-sig")
 
-def apply_richard_rules(row):
+def apply_validation_rules(row, alerts_df):
+    """Evalúa dinámicamente las reglas de la pestaña 'Alerts' del Excel."""
     acc = str(row.get('account_holder', '')).upper()
     comp = str(row.get('company', '')).upper()
     gl_hint = str(row.get('gl_account', '')).upper()
 
-    # REGLA: EXCEPTION
-    if "RICHARD LIBUTTI" in acc and "HAPPY TRAILERS" in comp:
-        return "EXCEPTION", "Richard Libutti no opera Happy Trailers"
+    if alerts_df is None or alerts_df.empty:
+        return "OK", ""
 
-    # REGLA: ALERT
-    if "RR REITER REALTY" in comp:
-        if "RAS" not in gl_hint and "RAS" not in comp:
-            return "ALERT", "RR Reiter pagado sin marca RAS"
+    for _, rule in alerts_df.iterrows():
+        # Extraemos los valores de la regla en el Excel (y manejamos celdas vacías)
+        r_type = str(rule.get('Rule_Type', '')).strip().upper()
+        if r_type == 'NAN' or not r_type:
+            continue
+
+        r_acc = str(rule.get('Account_Contains', '')).strip().upper()
+        r_comp = str(rule.get('Company_Contains', '')).strip().upper()
+        r_miss_gl = str(rule.get('Missing_Keyword_GL', '')).strip().upper()
+        r_miss_comp = str(rule.get('Missing_Keyword_Company', '')).strip().upper()
+        msg = str(rule.get('Message', '')).strip()
+
+        # Asumimos que la fila cumple la regla, hasta demostrar lo contrario
+        match = True
+        
+        # Verificamos cada condición: Si el Excel pide algo y la transacción no lo tiene, fallamos el match.
+        if r_acc != 'NAN' and r_acc and r_acc not in acc:
+            match = False
+        if r_comp != 'NAN' and r_comp and r_comp not in comp:
+            match = False
+            
+        # Para las palabras faltantes (Ej. debe FALTAR 'RAS'). Si la palabra SÍ ESTÁ, fallamos el match.
+        if r_miss_gl != 'NAN' and r_miss_gl and r_miss_gl in gl_hint:
+            match = False
+        if r_miss_comp != 'NAN' and r_miss_comp and r_miss_comp in comp:
+            match = False
+
+        # Si después de pasar los filtros el match sigue siendo True, aplicamos la alerta
+        if match:
+            return r_type, msg
 
     return "OK", ""
 
@@ -65,7 +91,16 @@ def main():
         return
 
     # Carga de catálogos
+    
     rules_df = pd.read_excel("data/master/mapping_rules.xlsx", sheet_name="Rules")
+    
+    # NUEVO: Cargamos la pestaña de alertas (con un try-except por si a alguien se le borra la pestaña)
+    try:
+        alerts_df = pd.read_excel("data/master/mapping_rules.xlsx", sheet_name="Alerts")
+    except Exception as e:
+        print(" No se encontró la pestaña 'Alerts' en el Excel. Saltando validaciones especiales.")
+        alerts_df = None
+
     gl_directory = pd.read_csv("data/clean/normalized_gl_accounts.csv")
     vendor_directory = pd.read_csv("data/clean/normalized_vendor_directory.csv")
     prop_dir = gl_directory.rename(columns={"code_raw": "normalized_property", "account_name": "raw_property"})
@@ -76,9 +111,9 @@ def main():
         df = pd.read_csv(path)
         df.columns = df.columns.str.lower()
 
-        # 1. Aplicar Reglas y Generar Log de Errores
+        # 1. Aplicar Reglas y Generar Log de Errores (AQUÍ CAMBIAMOS EL NOMBRE DE LA FUNCIÓN)
         df[['validation_status', 'validation_note']] = df.apply(
-            lambda r: pd.Series(apply_richard_rules(r)), axis=1
+            lambda r: pd.Series(apply_validation_rules(r, alerts_df)), axis=1
         )
 
         # Filtrar errores (ALERT y EXCEPTION) para guardarlos en el histórico de logs
@@ -96,6 +131,7 @@ def main():
             continue
 
         # 3. Resolución y Neteado (Lógica anterior)
+        df["prop_hint"] = df.iloc[:, 6].astype(str)
         df["resolved_vendor"] = df.apply(lambda r: resolve_vendor(r, vendor_directory, rules_df)[0], axis=1)
         df["resolved_property"] = df.apply(lambda r: resolve_property_code(r, prop_dir, rules_df)[0], axis=1)
         df["abs_amount"] = df["amount"].abs().round(2)
