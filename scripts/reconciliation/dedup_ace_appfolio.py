@@ -6,7 +6,7 @@ import os
 # 1. CONFIGURACIÓN
 # ============================================================
 AMEX_FILE = "data/clean/normalized_amex.csv"
-VENDOR_LEDGER = "data/raw/appfolio/vendor_ledger-20260116.csv"
+VENDOR_LEDGER = "data/raw/appfolio/vendor_ledger.csv"
 RULES_FILE = "data/master/mapping_rules.xlsx"
 OUTPUT_FILE = "data/clean/amex_ras_net_of_appfolio.csv"
 
@@ -43,7 +43,6 @@ def apply_mapping_rules(merchant_raw, rules_df):
         pattern = str(r["match_pattern"])
         if pattern == "nan": continue
         
-        # Uso de re.search en lugar de pd.Series().str.contains()
         try:
             if re.search(pattern, m): 
                 return pd.Series({"vendor": r["normalized_merchant"], "class": r["vendor_class"], "gl_hint": r.get("gl_hint", "")})
@@ -86,15 +85,15 @@ ledger["unpaid_clean"] = safe_clean_currency(ledger, "unpaid")
 
 if "vendor" not in ledger.columns:
     fallback = next(
-        (c for c in ["payee", "name", "vendor name"] if c in ledger.columns),
+        (c for c in ["payee name", "payee", "name", "vendor name"] if c in ledger.columns),
         "description"
     )
     ledger["vendor"] = ledger[fallback]
-    print(f"Columna vendor no encontrada, usando '{fallback}'")
+    print(f"Columna vendor asignada exitosamente desde: '{fallback}'")
 
 
 # ============================================================
-# 4. FUNCIÓN CORE — LEDGER COMO FUENTE DE VERDAD
+# 4. FUNCIÓN CORE — LEDGER COMO FUENTE DE VERDAD (DOBLE MALLA)
 # ============================================================
 def remove_amex_using_ledger_unpaid_exact(
     ledger_df: pd.DataFrame,
@@ -102,53 +101,84 @@ def remove_amex_using_ledger_unpaid_exact(
     vendor_key: str,
     amount_tolerance: float = 0.01
 ):
-    """
-    Elimina cargos AMEX buscando coincidencias exactas de monto con las facturas pendientes
-    en el Ledger (1-to-1 match).
-    """
     ledger = ledger_df.copy()
     amex = amex_df.copy()
 
-    # 1. Identificar facturas del proveedor en el Ledger
+    # Preparamos la columna Reference para que sea segura de leer
+    if "reference" not in ledger.columns:
+        ledger["reference"] = ""
+    ledger["reference_clean"] = ledger["reference"].astype(str).str.strip()
+
+    print(f"\n--- DIAGNÓSTICO PARA '{vendor_key}' ---")
+
+    # Aislar las facturas del proveedor
     vendor_mask = (
         ledger["vendor"].astype(str).str.upper().str.contains(vendor_key, na=False)
         | ledger["desc_clean"].str.contains(vendor_key, na=False)
-        # Opcional: | ledger.get("gl account", "").astype(str).str.contains("6435", na=False)
     )
 
-    bills = ledger[vendor_mask & (ledger["unpaid_clean"] > 0)]
-    
-    # Extraemos la lista de montos pendientes y los ordenamos (opcional, ayuda a procesar grandes primero)
-    unpaid_amounts = bills["unpaid_clean"].sort_values(ascending=False).tolist()
+    bills = ledger[vendor_mask & (ledger["unpaid_clean"] > 0)].copy()
 
-    if not unpaid_amounts:
-        print(f"No se encontró deuda pendiente para {vendor_key} en el Ledger.")
+    if bills.empty:
+        print(f"` No se encontró deuda pendiente para {vendor_key} en el Ledger.")
         return set(), 0.0
 
-    # 2. Aislar transacciones AMEX del proveedor
     amex_vendor = amex[amex["vendor"].str.upper().str.contains(vendor_key, na=False)]
     
     to_remove = set()
     matched_ledger_total = 0.0
+    matched_bill_indices = set() # Aquí guardaremos las facturas de AppFolio ya procesadas
 
-    # 3. Lógica de Emparejamiento Exacto (1-to-1)
+    # --------------------------------------------------
+    # MALLA 1: AGRUPACIÓN POR NÚMERO DE FACTURA (REFERENCE)
+    # --------------------------------------------------
+    # Filtramos referencias que SÍ sean válidas (no vacías, no cero)
+    valid_ref_mask = (
+        (bills["reference_clean"].str.len() > 1) & 
+        (~bills["reference_clean"].str.lower().isin(["nan", "0", "00", "000", "none", "null"]))
+    )
+    
+    grouped_bills = bills[valid_ref_mask].groupby("reference_clean")
+
+    for ref, group in grouped_bills:
+        # Sumamos todos los pedacitos de esa misma factura
+        group_total = group["unpaid_clean"].sum()
+        
+        # Buscamos si ese total exacto está en la AMEX
+        potential_matches = amex_vendor[
+            (~amex_vendor.index.isin(to_remove)) & 
+            (abs(amex_vendor["amount"] - group_total) <= amount_tolerance)
+        ].sort_values("date")
+        
+        if not potential_matches.empty:
+            match_idx = potential_matches.index[0]
+            to_remove.add(match_idx)
+            matched_ledger_total += group_total
+            matched_bill_indices.update(group.index.tolist())
+            print(f"  [MATCH GRUPAL] Referencia '{ref}': {len(group)} facturas sumaron ${group_total:.2f} == AMEX ${amex_vendor.loc[match_idx, 'amount']:.2f}")
+
+    # --------------------------------------------------
+    # MALLA 2: EMPAREJAMIENTO 1-A-1 (EL RESTO)
+    # --------------------------------------------------
+    # Quitamos las facturas de AppFolio que ya se lograron agrupar arriba
+    remaining_bills = bills[~bills.index.isin(matched_bill_indices)]
+    unpaid_amounts = remaining_bills["unpaid_clean"].sort_values(ascending=False).tolist()
+
     for bill_amount in unpaid_amounts:
-        # Buscar cargos AMEX que:
-        # - No hayan sido emparejados previamente (~isin(to_remove))
-        # - El monto coincida con el bill_amount (+/- tolerancia)
         potential_matches = amex_vendor[
             (~amex_vendor.index.isin(to_remove)) & 
             (abs(amex_vendor["amount"] - bill_amount) <= amount_tolerance)
-        ].sort_values("date") # Ordenar por fecha para tomar el cargo más antiguo en caso de empates
+        ].sort_values("date") 
 
         if not potential_matches.empty:
-            # ¡Match encontrado! Tomamos el índice del cargo AMEX más antiguo que encaja
             match_idx = potential_matches.index[0]
             to_remove.add(match_idx)
             matched_ledger_total += bill_amount
+            print(f"  [MATCH 1-a-1] Factura AppFolio ${bill_amount:.2f} == AMEX ${amex_vendor.loc[match_idx, 'amount']:.2f}")
+        else:
+            print(f"  Falló el cruce para factura de ${bill_amount:.2f}. No hay monto igual en AMEX.")
 
     return to_remove, matched_ledger_total
-
 
 # ============================================================
 # 5. DEDUPLICACIÓN ACE
@@ -166,9 +196,8 @@ if "appfolio_duplicate" not in amex.columns:
 
 amex.loc[amex.index.isin(to_remove), "appfolio_duplicate"] = True
 
-print(f"Ledger ACE (fuente de verdad): ${ledger_total:,.2f}")
+print(f"\nLedger ACE (fuente de verdad): ${ledger_total:,.2f}")
 print(f"AMEX eliminado: ${amex.loc[list(to_remove), 'amount'].sum():,.2f}")
-
 
 # ============================================================
 # 6. EXPORTACIÓN
@@ -180,7 +209,6 @@ final_df = (
 )
 
 removed_amt = amex.loc[amex["appfolio_duplicate"], "amount"].sum()
-
 print("\n" + "═" * 55)
 print(f"║ {'REPORTE FINAL: AMEX vs APPFOLIO (ACE)':^51} ║")
 print("═" * 55)
