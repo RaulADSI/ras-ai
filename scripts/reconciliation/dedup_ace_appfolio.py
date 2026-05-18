@@ -5,16 +5,26 @@ import os
 # ============================================================
 # 1. CONFIGURACIÓN
 # ============================================================
-AMEX_FILE = "data/clean/normalized_amex.csv"
 VENDOR_LEDGER = "data/raw/appfolio/vendor_ledger.csv"
 RULES_FILE = "data/master/mapping_rules.xlsx"
-OUTPUT_FILE = "data/clean/amex_ras_net_of_appfolio.csv"
 
-DATE_WINDOW_DAYS = 2
+JOBS = [
+    {
+        "input": "data/clean/normalized_amex.csv",
+        "output": "data/clean/amex_ras_net_of_appfolio.csv",
+        "label": "AMEX"
+    },
+    {
+        "input": "data/clean/normalized_citi.csv",
+        "output": "data/clean/normalized_citi.csv", 
+        "label": "CITI MASTERCARD"
+    }
+]
+
 AMOUNT_TOLERANCE = 0.01
 
 # ============================================================
-# 2. CARGA DE REGLAS
+# 2. CARGA DE REGLAS Y UTILS
 # ============================================================
 if os.path.exists(RULES_FILE):
     rules = pd.read_excel(RULES_FILE, sheet_name="Rules")
@@ -23,200 +33,225 @@ if os.path.exists(RULES_FILE):
         "Mapped_Value": "normalized_merchant",
         "Category": "vendor_class",
         "GL_Account_Hint": "gl_hint",
-    })
-    rules = rules.dropna(subset=["match_pattern"])
+    }).dropna(subset=["match_pattern"])
     if "priority" not in rules.columns:
         rules["priority"] = 10
     rules = rules.sort_values("priority", ascending=False)
     rules["match_pattern"] = rules["match_pattern"].astype(str).str.lower()
-    print("Reglas cargadas correctamente.")
 else:
     rules = None
 
-
 def apply_mapping_rules(merchant_raw, rules_df):
     if rules_df is None or pd.isna(merchant_raw):
-        return pd.Series({"vendor": str(merchant_raw).upper(), "class": "UNCLASSIFIED", "gl_hint": ""})
+        return pd.Series({"vendor": str(merchant_raw).upper(), "class": "UNCLASSIFIED"})
 
     m = str(merchant_raw).lower()
     for _, r in rules_df.iterrows():
         pattern = str(r["match_pattern"])
         if pattern == "nan": continue
-        
         try:
             if re.search(pattern, m): 
-                return pd.Series({"vendor": r["normalized_merchant"], "class": r["vendor_class"], "gl_hint": r.get("gl_hint", "")})
+                return pd.Series({"vendor": r["normalized_merchant"], "class": r["vendor_class"]})
         except re.error:
             continue
             
-    return pd.Series({"vendor": str(merchant_raw).upper(), "class": "UNCLASSIFIED", "gl_hint": ""})
-
-
-# ============================================================
-# 3. CARGA DE DATOS
-# ============================================================
-amex = pd.read_csv(AMEX_FILE, parse_dates=["date"])
-ledger = pd.read_csv(VENDOR_LEDGER)
-
-print(" Aplicando mapeo y clasificación...")
-amex = pd.concat(
-    [amex, amex["merchant"].apply(lambda x: apply_mapping_rules(x, rules))],
-    axis=1
-)
-
-ledger.columns = ledger.columns.str.strip().str.lower()
+    return pd.Series({"vendor": str(merchant_raw).upper(), "class": "UNCLASSIFIED"})
 
 def safe_clean_currency(df, col):
     if col not in df.columns:
         return pd.Series(0.0, index=df.index)
-    return (
-        pd.to_numeric(
-            df[col].astype(str).replace(r"[^\d\.-]", "", regex=True),
-            errors="coerce"
-        )
-        .fillna(0.0)
-        .round(2)
-    )
-
-ledger["bill_date_clean"] = pd.to_datetime(ledger.get("bill date"), errors="coerce")
-ledger["desc_clean"] = ledger.get("description", "").astype(str).str.upper()
-ledger["amount_clean"] = safe_clean_currency(ledger, "amount")
-ledger["unpaid_clean"] = safe_clean_currency(ledger, "unpaid")
-
-if "vendor" not in ledger.columns:
-    fallback = next(
-        (c for c in ["payee name", "payee", "name", "vendor name"] if c in ledger.columns),
-        "description"
-    )
-    ledger["vendor"] = ledger[fallback]
-    print(f"Columna vendor asignada exitosamente desde: '{fallback}'")
-
+    return pd.to_numeric(df[col].astype(str).replace(r"[^\d\.-]", "", regex=True), errors="coerce").fillna(0.0).round(2)
 
 # ============================================================
-# 4. FUNCIÓN CORE — LEDGER COMO FUENTE DE VERDAD (DOBLE MALLA)
+# 3. FUNCIÓN CORE: CRUCE POR TOKENS Y SEGUIMIENTO DEL LEDGER
 # ============================================================
-def remove_amex_using_ledger_unpaid_exact(
-    ledger_df: pd.DataFrame,
-    amex_df: pd.DataFrame,
-    vendor_key: str,
-    amount_tolerance: float = 0.01
-):
-    ledger = ledger_df.copy()
-    amex = amex_df.copy()
+def clean_tokens(text):
+    if pd.isna(text):
+        return set()
+    clean = re.sub(r"[^\w\s]", " ", str(text).upper())
+    tokens = set(clean.split())
+    noise = {"THE", "INC", "CORP", "LLC", "CO", "AND", "DE", "LA", "LAS", "LOS", "SERVICES", "GROUP"}
+    tokens -= noise
+    return tokens
 
-    # Preparamos la columna Reference para que sea segura de leer
-    if "reference" not in ledger.columns:
-        ledger["reference"] = ""
-    ledger["reference_clean"] = ledger["reference"].astype(str).str.strip()
-
-    print(f"\n--- DIAGNÓSTICO PARA '{vendor_key}' ---")
-
-    # Aislar las facturas del proveedor
-    vendor_mask = (
-        ledger["vendor"].astype(str).str.upper().str.contains(vendor_key, na=False)
-        | ledger["desc_clean"].str.contains(vendor_key, na=False)
-    )
-
-    bills = ledger[vendor_mask & (ledger["unpaid_clean"] > 0)].copy()
-
-    if bills.empty:
-        print(f"` No se encontró deuda pendiente para {vendor_key} en el Ledger.")
-        return set(), 0.0
-
-    amex_vendor = amex[amex["vendor"].str.upper().str.contains(vendor_key, na=False)]
-    
+def deduplicate_card_against_ledger(card_df, ledger_df, vendor_key):
     to_remove = set()
-    matched_ledger_total = 0.0
-    matched_bill_indices = set() # Aquí guardaremos las facturas de AppFolio ya procesadas
+    card_tokens = clean_tokens(vendor_key)
+    if not card_tokens:
+        return to_remove
 
-    # --------------------------------------------------
-    # MALLA 1: AGRUPACIÓN POR NÚMERO DE FACTURA (REFERENCE)
-    # --------------------------------------------------
-    # Filtramos referencias que SÍ sean válidas (no vacías, no cero)
+    def is_vendor_match(row):
+        ledger_v_tokens = clean_tokens(row["vendor"])
+        ledger_d_tokens = clean_tokens(row["desc_clean"])
+        combined_ledger_tokens = ledger_v_tokens | ledger_d_tokens
+        return bool(card_tokens.intersection(combined_ledger_tokens))
+
+    # Identificar las filas del Ledger que pertenecen a este proveedor
+    vendor_mask = ledger_df.apply(is_vendor_match, axis=1)
+    bills = ledger_df[vendor_mask].copy()
+    if bills.empty:
+        return to_remove
+
+    # Filtrar la tarjeta
+    card_vendor = card_df[card_df["vendor"].str.upper().str.contains(list(card_tokens)[0], na=False, regex=False)].copy()
+    if card_vendor.empty:
+        return to_remove
+
+    # Asegurar e identificar referencias
+    bills["reference_clean"] = bills["reference"].astype(str).str.strip()
     valid_ref_mask = (
         (bills["reference_clean"].str.len() > 1) & 
-        (~bills["reference_clean"].str.lower().isin(["nan", "0", "00", "000", "none", "null"]))
+        (~bills["reference_clean"].str.lower().isin(["nan", "0", "00", "none", "null"]))
     )
     
-    grouped_bills = bills[valid_ref_mask].groupby("reference_clean")
-
-    for ref, group in grouped_bills:
-        # Sumamos todos los pedacitos de esa misma factura
-        group_total = group["unpaid_clean"].sum()
+    referenced_bills = bills[valid_ref_mask].copy()
+    unreferenced_bills = bills[~valid_ref_mask].copy()
+    
+    logical_invoices = []
+    
+    # Universo A: Agrupados por Referencia
+    if not referenced_bills.empty:
+        grouped = referenced_bills.groupby("reference_clean")
+        for ref, group in grouped:
+            total_unpaid = group["unpaid_clean"].sum()
+            logical_invoices.append({
+                "id": ref,
+                "type": "ID_REFERENCE",
+                "amount": abs(total_unpaid),
+                "original_indices": group.index.tolist()
+            })
+            
+    # Universo B: Filas individuales sin referencia
+    for idx, row in unreferenced_bills.iterrows():
+        logical_invoices.append({
+            "id": f"ROW_{idx}",
+            "type": "INDIVIDUAL_ROW",
+            "amount": abs(row["unpaid_clean"]),
+            "original_indices": [idx]
+        })
         
-        # Buscamos si ese total exacto está en la AMEX
-        potential_matches = amex_vendor[
-            (~amex_vendor.index.isin(to_remove)) & 
-            (abs(amex_vendor["amount"] - group_total) <= amount_tolerance)
+    logical_invoices = sorted(logical_invoices, key=lambda x: (x["type"] != "ID_REFERENCE", -x["amount"]))
+    
+    # Cruce matemático
+    for inv in logical_invoices:
+        inv_amount = inv["amount"]
+        potential_matches = card_vendor[
+            (~card_vendor.index.isin(to_remove)) & 
+            (abs(card_vendor["amount"].abs() - inv_amount) <= AMOUNT_TOLERANCE)
         ].sort_values("date")
         
         if not potential_matches.empty:
             match_idx = potential_matches.index[0]
             to_remove.add(match_idx)
-            matched_ledger_total += group_total
-            matched_bill_indices.update(group.index.tolist())
-            print(f"  [MATCH GRUPAL] Referencia '{ref}': {len(group)} facturas sumaron ${group_total:.2f} == AMEX ${amex_vendor.loc[match_idx, 'amount']:.2f}")
-
-    # --------------------------------------------------
-    # MALLA 2: EMPAREJAMIENTO 1-A-1 (EL RESTO)
-    # --------------------------------------------------
-    # Quitamos las facturas de AppFolio que ya se lograron agrupar arriba
-    remaining_bills = bills[~bills.index.isin(matched_bill_indices)]
-    unpaid_amounts = remaining_bills["unpaid_clean"].sort_values(ascending=False).tolist()
-
-    for bill_amount in unpaid_amounts:
-        potential_matches = amex_vendor[
-            (~amex_vendor.index.isin(to_remove)) & 
-            (abs(amex_vendor["amount"] - bill_amount) <= amount_tolerance)
-        ].sort_values("date") 
-
-        if not potential_matches.empty:
-            match_idx = potential_matches.index[0]
-            to_remove.add(match_idx)
-            matched_ledger_total += bill_amount
-            print(f"  [MATCH 1-a-1] Factura AppFolio ${bill_amount:.2f} == AMEX ${amex_vendor.loc[match_idx, 'amount']:.2f}")
-        else:
-            print(f"  Falló el cruce para factura de ${bill_amount:.2f}. No hay monto igual en AMEX.")
-
-    return to_remove, matched_ledger_total
+            
+            # 🔥 MARCAR EN EL LEDGER ORIGINAL QUE ESTAS FILAS YA HICIERON MATCH
+            ledger_df.loc[inv["original_indices"], "matched_to_card"] = True
+                
+    return to_remove
 
 # ============================================================
-# 5. DEDUPLICACIÓN ACE
+# 4. PIPELINE PRINCIPAL
 # ============================================================
-print("\n Ejecutando deduplicación ACE (Ledger-driven)...")
+def main():
+    project_root = os.getcwd()
+    
+    if not os.path.exists(VENDOR_LEDGER):
+        print(f"Error: No se encontró el Ledger en {VENDOR_LEDGER}")
+        return
 
-to_remove, ledger_total = remove_amex_using_ledger_unpaid_exact(
-    ledger_df=ledger,
-    amex_df=amex,
-    vendor_key="ACE"
-)
+    # Cargar Ledger
+    ledger = pd.read_csv(VENDOR_LEDGER)
+    ledger.columns = ledger.columns.str.strip().str.lower()
+    
+    ledger = ledger.rename(columns={
+        "gl accour": "gl_account",
+        "descriptic": "description",
+        "payee name": "vendor",    
+        "payee": "vendor",         
+        "vendor name": "vendor"    
+    })
+    
+    if "vendor" not in ledger.columns:
+        for col in ledger.columns:
+            if "payee" in col or "vendor" in col or "name" in col:
+                ledger = ledger.rename(columns={col: "vendor"})
+                break
 
-if "appfolio_duplicate" not in amex.columns:
-    amex["appfolio_duplicate"] = False
+    if "vendor" not in ledger.columns:
+        ledger["vendor"] = ledger.get("description", "")
 
-amex.loc[amex.index.isin(to_remove), "appfolio_duplicate"] = True
+    # Limpieza de totales e inválidos
+    ledger["vendor"] = ledger["vendor"].astype(str).str.strip()
+    invalid_vendors = ["NAN", "NONE", "NULL", ""]
+    ledger.loc[ledger["vendor"].str.upper().isin(invalid_vendors), "vendor"] = None
+    ledger = ledger.dropna(subset=["vendor"]).copy()
+    
+    ledger["desc_clean"] = ledger.get("description", "").astype(str).str.upper()
+    total_mask = (
+        ledger["vendor"].str.upper().str.contains("TOTAL", na=False) |
+        ledger["desc_clean"].str.contains("TOTAL", na=False)
+    )
+    ledger = ledger[~total_mask].copy()
 
-print(f"\nLedger ACE (fuente de verdad): ${ledger_total:,.2f}")
-print(f"AMEX eliminado: ${amex.loc[list(to_remove), 'amount'].sum():,.2f}")
+    ledger["unpaid_clean"] = safe_clean_currency(ledger, "unpaid")
+    ledger = ledger[ledger["unpaid_clean"] > 0].copy()
 
-# ============================================================
-# 6. EXPORTACIÓN
-# ============================================================
-final_df = (
-    amex[~amex["appfolio_duplicate"]]
-    .sort_values("date")
-    .reset_index(drop=True)
-)
+    # Inicializamos la columna de control para marcar qué deudas se pagaron con tarjeta
+    ledger["matched_to_card"] = False
 
-removed_amt = amex.loc[amex["appfolio_duplicate"], "amount"].sum()
-print("\n" + "═" * 55)
-print(f"║ {'REPORTE FINAL: AMEX vs APPFOLIO (ACE)':^51} ║")
-print("═" * 55)
-print(f"║ {'Monto ACE detectado en AMEX:':<35} ${amex[amex['vendor'].str.contains('ACE', na=False)]['amount'].sum():>11,.2f} ║")
-print(f"║ {'Monto duplicado en AppFolio:':<35} ${removed_amt:>11,.2f} ║")
-print("╟" + "─" * 53 + "╢")
-print(f"║ {'VALOR NETO A CONTABILIZAR:':<35} ${final_df['amount'].sum():>11,.2f} ║")
-print("╚" + "═" * 53 + "╝")
+    print(f"--- DIAGNÓSTICO DEL LEDGER APPFOLIO (CONSOLIDADO) ---")
+    print(f"Total de deuda viva real en Ledger: ${ledger['unpaid_clean'].sum():,.2f}")
+    print(r"--------------------------------------------------")
 
-final_df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
-print(f"Archivo generado: {OUTPUT_FILE}")
+    for job in JOBS:
+        input_file_path = os.path.join(project_root, job["input"])
+        if not os.path.exists(input_file_path):
+            print(f"\nSaltando {job['label']}: archivo no encontrado.")
+            continue
+            
+        print(f"\n🚀 Deduplicando {job['label']} contra AppFolio...")
+        card = pd.read_csv(input_file_path, parse_dates=["date"])
+        
+        if "vendor" not in card.columns:
+            mapped_cols = card["merchant"].apply(lambda x: apply_mapping_rules(x, rules))
+            card = pd.concat([card, mapped_cols], axis=1)
+
+        unique_vendors = card["vendor"].dropna().astype(str).str.upper().unique()
+        all_to_remove = set()
+        
+        for v_key in unique_vendors:
+            detected_indices = deduplicate_card_against_ledger(card, ledger, v_key)
+            all_to_remove.update(detected_indices)
+
+        card["appfolio_duplicate"] = card.index.isin(all_to_remove)
+        
+        # Archivo neto listo para el main.py
+        final_df = card[~card["appfolio_duplicate"]].sort_values("date").reset_index(drop=True)
+        output_work_path = os.path.join(project_root, job["output"])
+        final_df.to_csv(output_work_path, index=False, encoding="utf-8-sig")
+        
+        initial_amt = card["amount"].sum()
+        clean_amt = final_df["amount"].sum()
+        duplicated_amt = card.loc[list(all_to_remove), "amount"].sum()
+        
+        print(f"   Monto inicial {job['label']}: ${initial_amt:,.2f}")
+        print(f"   ❌ Duplicados removidos de tarjeta:   ${duplicated_amt:,.2f}")
+        print(f"   ✅ Neto tarjeta a contabilizar:      ${clean_amt:,.2f}")
+
+    # ============================================================
+    # 🔥 GENERACIÓN DEL REPORTE DE LAS FACTURAS HUÉRFANAS ($136.58)
+    # ============================================================
+    print("\n📊 Generando reporte de deudas AppFolio sin cobrar...")
+    unmatched_ledger = ledger[~ledger["matched_to_card"]].copy()
+    
+    # Removemos columnas temporales internas de control de Python
+    unmatched_ledger = unmatched_ledger.drop(columns=["desc_clean", "unpaid_clean", "matched_to_card"], errors="ignore")
+    
+    output_report_path = os.path.join(project_root, "data", "clean", "reporte_facturas_AppFolio_NO_encontradas.csv")
+    unmatched_ledger.to_csv(output_report_path, index=False, encoding="utf-8-sig")
+    
+    print(f"   ❌ Monto total huérfano en AppFolio: ${safe_clean_currency(unmatched_ledger, 'unpaid').sum():,.2f}")
+    print(f"   📂 Archivo de auditoría listo en: data/clean/reporte_facturas_AppFolio_NO_encontradas.csv")
+
+if __name__ == "__main__":
+    main()
