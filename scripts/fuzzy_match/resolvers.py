@@ -1,64 +1,38 @@
+"""
+scripts/fuzzy_match/resolvers.py
+Fachada de compatibilidad hacia atrás.
+Delega toda la resolución a RulesManager, eliminando la duplicación de lógica.
+"""
+
 import pandas as pd
-from .utils import normalize, is_ambiguous, get_best_match 
+from typing import Tuple, Optional
+from scripts.rules_manager import RulesManager
 
-def apply_rules(name: str, rules_df: pd.DataFrame, category: str) -> str | None:
-    """
-    Busca coincidencias de texto basadas en la categoría del Master Excel.
-    """
-    if not name or pd.isna(name):
-        return None
-    
-    # Filtrar reglas por categoría (Vendor, Property, etc.)
-    subset = rules_df[rules_df["Category"] == category]
-    norm_name = str(name).upper().strip()
-    
-    for _, row in subset.iterrows():
-        key = str(row["Raw_Text (Key)"]).upper().strip()
-        if key in norm_name:
-            return row["Mapped_Value"]
-    return None
+# Instancia compartida por defecto si no se inyecta una
+_DEFAULT_MANAGER: Optional[RulesManager] = None
 
-def resolve_property_code(row, property_directory, rules_df, score_cutoff=75):
-    """
-    Resuelve la propiedad usando el prop_hint (columna 7).
-    """
-    prop_hint = str(row.get("prop_hint", "")).upper().strip()
-    
-    # Prioridad 1: Mapeo directo de código en Excel (ej. '930' -> Dirección larga)
-    direct_match = apply_rules(prop_hint, rules_df, "Property")
-    if direct_match:
-        return direct_match, 100, "excel_mapping"
+def _get_manager(rules_manager: Optional[RulesManager] = None) -> RulesManager:
+    global _DEFAULT_MANAGER
+    if rules_manager is not None:
+        return rules_manager
+    if _DEFAULT_MANAGER is None:
+        _DEFAULT_MANAGER = RulesManager()
+    return _DEFAULT_MANAGER
 
-    # Fallback: Si no hay match directo en el Excel, devolvemos una alerta clara
-    # para que un humano lo asigne en el CSV final.
-    return f"REVISAR PROP: {prop_hint}", 0, "unresolved"
+def resolve_vendor(row: pd.Series, vendor_directory=None, rules_df=None, score_cutoff: int = 67) -> Tuple[str, float]:
+    """Adaptador de compatibilidad para resolve_vendor."""
+    manager = _get_manager()
+    merchant = row.get("merchant", "")
+    target, score, _ = manager.resolve_vendor(merchant, score_cutoff=score_cutoff)
+    return target, score
 
-def resolve_vendor(row, vendor_directory, rules_df, score_cutoff=67):
-    """
-    Resuelve el Vendor priorizando las reglas del Master Excel.
-    """
-    merchant = str(row.get("merchant", ""))
-    
-    # Prioridad 1: Reglas de Excel (Mapea 'WCI*6440' -> 'Waste Connections')
-    clean_name = apply_rules(merchant, rules_df, "Vendor")
-    if clean_name:
-        return clean_name, 100.0
+def resolve_property_code(row: pd.Series, property_directory=None, rules_df=None, score_cutoff: int = 75) -> Tuple[str, float, str]:
+    """Adaptador de compatibilidad para resolve_property_code."""
+    manager = _get_manager()
+    prop_hint = row.get("prop_hint") or row.get("gl_account") or row.get("company", "")
+    return manager.resolve_property(prop_hint, score_cutoff=score_cutoff)
 
-    # Prioridad 2: Fuzzy match contra el directorio
-    choices = vendor_directory["normalized_company"].dropna().astype(str).tolist()
-    match, score = get_best_match(merchant, choices, score_cutoff=score_cutoff)
-
-    if match:
-        row_match = vendor_directory.loc[vendor_directory["normalized_company"] == match, "company_name"]
-        if not row_match.empty:
-            return row_match.iloc[0], score
-
-    return merchant, 0.0
-
-def resolve_cash_account(card_key: str, rules_df: pd.DataFrame) -> str:
-    """
-    Obtiene '1170: Amex' o '1180: AA Mastercard' desde el Excel.
-    """
-    subset = rules_df[rules_df["Category"] == "Cash"]
-    mapping = dict(subset[["Raw_Text (Key)", "Mapped_Value"]].values)
-    return mapping.get(card_key, "1150: Operating")
+def resolve_cash_account(card_key: str, rules_df=None) -> str:
+    """Adaptador de compatibilidad para resolve_cash_account."""
+    manager = _get_manager()
+    return manager.resolve_cash_account(card_key)
