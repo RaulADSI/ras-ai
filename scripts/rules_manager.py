@@ -74,20 +74,19 @@ class RulesManager:
     def __init__(self, rules_path: Path = MAPPING_RULES):
         self.rules_path = rules_path
         
-        # Índices en memoria para lookups directos O(1)
+        # Índices en memoria O(1)
         self.vendor_to_gl: Dict[str, str] = {}
         self.cash_accounts: Dict[str, str] = {}
         self.property_groups: Dict[str, List[Tuple[str, float]]] = {}
         self.vendor_directory_map: Dict[str, str] = {}
         self.property_directory_map: Dict[str, str] = {}
+        self.property_code_map: Dict[str, str] = {}  # <-- Nuevo Índice O(1) por Código Corto
 
-        # Estructuras precompiladas para matching determinístico O(K)
+        # Matchers y Catálogos
         self.manual_vendor_matchers: List[Tuple[re.Pattern, str]] = []
         self.vendor_regex_rules: List[Tuple[re.Pattern, str]] = []
         self.property_regex_rules: List[Tuple[re.Pattern, str]] = []
         self.alerts_rules: List[dict] = []
-
-        # Listas de candidatos normalizados para Fuzzy Matching O(M)
         self.vendor_directory_choices: List[str] = []
         self.property_directory_choices: List[str] = []
 
@@ -192,8 +191,14 @@ class RulesManager:
                 valid_p = p_df.dropna(subset=["normalized_property", "raw_property"])
                 for _, r in valid_p.iterrows():
                     norm_p = normalize_text(r["normalized_property"])
-                    self.property_directory_map[norm_p] = str(r["raw_property"]).strip()
-                self.property_directory_choices = list(self.property_directory_map.keys())
+                    real_p = str(r["raw_property"]).strip()
+                    self.property_directory_map[norm_p] = real_p
+
+                    # Poblar mapa de códigos si existe
+                    if "property_code" in r and pd.notna(r["property_code"]):
+                        code_norm = normalize_text(r["property_code"])
+                        if code_norm:
+                            self.property_code_map[code_norm] = real_p
 
     # ==============================================================================
     # RESOLVERS Y EVALUADORES
@@ -232,10 +237,12 @@ class RulesManager:
 
     def resolve_property(self, prop_hint_raw: object, score_cutoff: int = 75) -> Tuple[str, float, str]:
         """
-        Jerarquía Determinística:
-        1. Exact / Pattern Rule en Excel Maestro
-        2. Fuzzy Match sobre property_directory
-        3. Fallback de Revisión
+        Jerarquía Determinística de Resolución:
+        1. Reglas / Aliases Explícitos en Excel Maestro (mapping_rules.xlsx)
+        2. Búsqueda Exacta por Nombre en Catálogo O(1) (normalized_property_directory.csv)
+        3. Búsqueda por Código Corto en Catálogo O(1) (property_code_map)
+        4. Coincidencia Difusa O(M) sobre el Catálogo
+        5. Fallback a Reporte de Revisión
         """
         norm_prop = normalize_text(prop_hint_raw)
         if not norm_prop:
@@ -243,12 +250,20 @@ class RulesManager:
 
         raw_display = str(prop_hint_raw).strip()
 
-        # 1. Excel Rules
+        # 1. Reglas Explícitas en Excel
         for pattern, target in self.property_regex_rules:
             if pattern.search(norm_prop):
                 return target, 100.0, "excel_rule"
 
-        # 2. Fuzzy Match
+        # 2. Match Exacto por Nombre O(1)
+        if norm_prop in self.property_directory_map:
+            return self.property_directory_map[norm_prop], 100.0, "directory_exact"
+
+        # 3. Match Exacto por Código Corto O(1)
+        if norm_prop in self.property_code_map:
+            return self.property_code_map[norm_prop], 100.0, "directory_code"
+
+        # 4. Fuzzy Matching O(M)
         if self.property_directory_choices:
             match_norm, score = get_best_match(norm_prop, self.property_directory_choices, score_cutoff=score_cutoff)
             if match_norm and match_norm in self.property_directory_map:
