@@ -71,7 +71,7 @@ NORMALIZED_STATEMENT_SCHEMA: List[str] = [
     "amount",
     "company",
     "gl_account",
-    "property_hint"  # <-- Contrato explícito: pista obligatoria para resolver propiedades
+    "property_hint"  
 ]
 
 # Contrato estricto exigido por AppFolio para Bulk Bills

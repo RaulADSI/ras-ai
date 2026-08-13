@@ -83,8 +83,24 @@ def run(rules: RulesManager) -> int:
     amex = pd.concat(dfs, ignore_index=True)
     raw_rows = len(amex)
 
-    # 1. Asegurar presencia y formato seguro de columnas requeridas
-    for col in ["account_holder", "company", "gl_account", "merchant", "amount", "date"]:
+    # 1. Mapeo case-insensitive de sinónimos de columnas crudas
+    column_synonyms = {
+        "account": "account_holder",
+        "gl": "gl_account",
+        "desc": "merchant",
+        "description": "merchant"
+    }
+
+    renames = {
+        col: column_synonyms[col.strip().lower()]
+        for col in amex.columns
+        if col.strip().lower() in column_synonyms
+    }
+    amex = amex.rename(columns=renames)
+
+    # 2. Asegurar presencia y formato seguro de columnas requeridas
+    required_columns = ["account_holder", "company", "gl_account", "merchant", "amount", "date"]
+    for col in required_columns:
         if col not in amex.columns:
             amex[col] = ""
         else:
@@ -92,7 +108,7 @@ def run(rules: RulesManager) -> int:
 
     amex["amount"] = clean_currency(amex["amount"])
 
-    # 2. Deduplicación por transacción exacta
+    # 3. Deduplicación por transacción exacta
     key_cols = ["date", "merchant", "amount"]
     amex["occ"] = amex.groupby(key_cols).cumcount()
     amex["dedup_key"] = (
@@ -103,13 +119,12 @@ def run(rules: RulesManager) -> int:
     )
     amex = amex.drop_duplicates("dedup_key").copy()
 
-    # 3. Filtro de negocio RAS
+    # 4. Filtro de negocio RAS
     amex = apply_business_rules(amex)
 
-    # 4. Construcción canónica del schema
+    # 5. Construcción canónica del schema y property_hint
     amex["date"] = pd.to_datetime(amex["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    
-    # Asignación contractual de property_hint
+
     gl_clean = amex["gl_account"].str.strip()
     amex["property_hint"] = amex["gl_account"].where(gl_clean != "", amex["company"])
 
