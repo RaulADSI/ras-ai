@@ -80,7 +80,7 @@ class RulesManager:
         self.property_groups: Dict[str, List[Tuple[str, float]]] = {}
         self.vendor_directory_map: Dict[str, str] = {}
         self.property_directory_map: Dict[str, str] = {}
-        self.property_code_map: Dict[str, str] = {}  # <-- Nuevo Índice O(1) por Código Corto
+        self.property_code_map: Dict[str, str] = {}  # Índices O(1) por Código Corto
 
         # Matchers y Catálogos
         self.manual_vendor_matchers: List[Tuple[re.Pattern, str]] = []
@@ -200,6 +200,8 @@ class RulesManager:
                         if code_norm:
                             self.property_code_map[code_norm] = real_p
 
+                self.property_directory_choices = list(self.property_directory_map.keys())
+
     # ==============================================================================
     # RESOLVERS Y EVALUADORES
     # ==============================================================================
@@ -223,9 +225,9 @@ class RulesManager:
                 return target, 100.0, "manual_override"
 
         # 2. Excel Rules
-        for pattern, target in self.vendor_regex_rules:
+        for pattern, pattern_target in self.vendor_regex_rules:
             if pattern.search(norm_merchant):
-                return target, 100.0, "excel_rule"
+                return pattern_target, 100.0, "excel_rule"
 
         # 3. Fuzzy Match
         if self.vendor_directory_choices:
@@ -235,36 +237,47 @@ class RulesManager:
 
         return raw_display, 0.0, "fallback_raw"
 
-    def resolve_property(self, prop_hint_raw: object, score_cutoff: int = 75) -> Tuple[str, float, str]:
+    def resolve_property(
+        self,
+        prop_hint_raw: object,
+        merchant: object = "",
+        gl_account: object = "",
+        score_cutoff: int = 75
+    ) -> Tuple[str, float, str]:
         """
-        Jerarquía Determinística de Resolución:
-        1. Reglas / Aliases Explícitos en Excel Maestro (mapping_rules.xlsx)
-        2. Búsqueda Exacta por Nombre en Catálogo O(1) (normalized_property_directory.csv)
-        3. Búsqueda por Código Corto en Catálogo O(1) (property_code_map)
-        4. Coincidencia Difusa O(M) sobre el Catálogo
+        Jerarquía Determinística de Resolución de Propiedad:
+        1. Reglas Explícitas de Propiedad en Excel (Evaluadas contra Merchant, Prop Hint y GL Hint)
+        2. Búsqueda Exacta por Nombre en Catálogo O(1)
+        3. Búsqueda por Código Corto O(1) (property_code_map)
+        4. Coincidencia Difusa O(M) sobre la pista de propiedad
         5. Fallback a Reporte de Revisión
         """
         norm_prop = normalize_text(prop_hint_raw)
-        if not norm_prop:
+        norm_merchant = normalize_text(merchant)
+        norm_gl = normalize_text(gl_account)
+
+        if not norm_prop and not norm_merchant:
             return "REVISAR PROP: VACIO", 0.0, "unresolved"
 
-        raw_display = str(prop_hint_raw).strip()
+        raw_display = str(prop_hint_raw).strip() or str(merchant).strip()
 
-        # 1. Reglas Explícitas en Excel
+        # 1. Reglas de Excel: evalúa coincidencia en Merchant, Prop Hint o GL Hint
         for pattern, target in self.property_regex_rules:
-            if pattern.search(norm_prop):
+            if (norm_merchant and pattern.search(norm_merchant)) or \
+               (norm_prop and pattern.search(norm_prop)) or \
+               (norm_gl and pattern.search(norm_gl)):
                 return target, 100.0, "excel_rule"
 
-        # 2. Match Exacto por Nombre O(1)
+        # 2. Match Exacto por Nombre en Catálogo O(1)
         if norm_prop in self.property_directory_map:
             return self.property_directory_map[norm_prop], 100.0, "directory_exact"
 
-        # 3. Match Exacto por Código Corto O(1)
+        # 3. Match por Código Corto de Propiedad O(1)
         if norm_prop in self.property_code_map:
             return self.property_code_map[norm_prop], 100.0, "directory_code"
 
-        # 4. Fuzzy Matching O(M)
-        if self.property_directory_choices:
+        # 4. Coincidencia Difusa O(M) sobre la pista de propiedad
+        if norm_prop and self.property_directory_choices:
             match_norm, score = get_best_match(norm_prop, self.property_directory_choices, score_cutoff=score_cutoff)
             if match_norm and match_norm in self.property_directory_map:
                 return self.property_directory_map[match_norm], score, "fuzzy_match"

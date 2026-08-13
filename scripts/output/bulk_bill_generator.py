@@ -33,7 +33,6 @@ def split_allocations(df_netted: pd.DataFrame, property_groups: dict) -> pd.Data
     if not property_groups or df_netted.empty:
         return df_netted
 
-    # Mapeo normalizado e insensible a mayúsculas/espacios
     property_to_group = {
         normalize_text(prop): grp 
         for grp, props in property_groups.items() 
@@ -106,9 +105,16 @@ def process_card_dataset(
         pd.DataFrame(columns=FINAL_APPFOLIO_COLUMNS).to_csv(output_file, index=False, encoding="utf-8-sig")
         return 0, len(errors)
 
-    # 2. Resolución de Entidades
+    # 2. Resolución Contextualizada de Entidades
     df_valid["resolved_vendor"] = df_valid["merchant"].apply(lambda m: rules.resolve_vendor(m)[0])
-    df_valid["resolved_property"] = df_valid["property_hint"].apply(lambda p: rules.resolve_property(p)[0])
+    df_valid["resolved_property"] = df_valid.apply(
+        lambda r: rules.resolve_property(
+            r.get("property_hint"),
+            merchant=r.get("merchant"),
+            gl_account=r.get("gl_account")
+        )[0],
+        axis=1
+    )
     df_valid["abs_amount"] = df_valid["amount"].abs().round(2)
 
     # 3. Neteado de transacciones opuestas
@@ -155,6 +161,6 @@ def run_generation(rules: RulesManager, run_id: str) -> Dict[str, Any]:
 
     return {
         "amex_bills": amex_bills,
-        "citi_bills": citi_bills,
+        "citi_bills": citi_warnings,
         "warnings": amex_warnings + citi_warnings
     }
