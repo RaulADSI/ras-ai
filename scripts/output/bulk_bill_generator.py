@@ -1,8 +1,9 @@
 """
-main.py
+scripts/output/bulk_bill_generator.py
 Módulo generador de Bulk Bills finales y ejecutor de prorrateos ponderados.
 """
 
+from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Tuple
 import pandas as pd
@@ -15,7 +16,7 @@ from scripts.config import (
     LOGS_DIR,
     FINAL_APPFOLIO_COLUMNS
 )
-from scripts.rules_manager import RulesManager
+from scripts.rules_manager import RulesManager, normalize_text
 
 
 def write_audit_log(df_errors: pd.DataFrame, log_filename: Path) -> None:
@@ -28,19 +29,23 @@ def write_audit_log(df_errors: pd.DataFrame, log_filename: Path) -> None:
 
 
 def split_allocations(df_netted: pd.DataFrame, property_groups: dict) -> pd.DataFrame:
+    """Distribución de gastos con balanceo de centavos en la última propiedad."""
     if not property_groups or df_netted.empty:
         return df_netted
 
+    # Mapeo normalizado e insensible a mayúsculas/espacios
     property_to_group = {
-        prop: grp 
+        normalize_text(prop): grp 
         for grp, props in property_groups.items() 
         for prop, _ in props
     }
 
     expanded_rows = []
     for _, row in df_netted.iterrows():
-        prop = str(row["resolved_property"]).strip()
-        target_group = property_groups.get(prop) or property_groups.get(property_to_group.get(prop))
+        prop_str = str(row["resolved_property"]).strip()
+        prop_norm = normalize_text(prop_str)
+        
+        target_group = property_groups.get(prop_norm) or property_groups.get(property_to_group.get(prop_norm))
 
         if target_group:
             total_weight = sum(w for _, w in target_group)
@@ -86,7 +91,7 @@ def process_card_dataset(
 
     df.columns = df.columns.str.lower()
 
-    # 1. Validaciones
+    # 1. Validaciones dinámicas (Alerts)
     validation_results = df.apply(rules.evaluate_row_alerts, axis=1)
     df["validation_status"] = [v[0] for v in validation_results]
     df["validation_note"] = [v[1] for v in validation_results]
@@ -117,7 +122,7 @@ def process_card_dataset(
     # 4. Prorrateos
     df_netted = split_allocations(df_netted, rules.property_groups)
 
-    # 5. Ensamble Final con contrato AppFolio
+    # 5. Ensamble Final con contrato estricto de AppFolio
     cash_account = rules.resolve_cash_account(card_key)
 
     final_df = pd.DataFrame({
@@ -142,7 +147,7 @@ def process_card_dataset(
 
 
 def run_generation(rules: RulesManager, run_id: str) -> Dict[str, Any]:
-    """Punto de entrada para el orquestador run_pipeline.py."""
+    """Punto de entrada para run_pipeline.py."""
     audit_file = LOGS_DIR / f"audit_log_{datetime.now().strftime('%Y-%m')}.csv"
 
     amex_bills, amex_warnings = process_card_dataset("amex", AMEX_NETTED, AMEX_BULK_BILL, rules, audit_file)
@@ -153,9 +158,3 @@ def run_generation(rules: RulesManager, run_id: str) -> Dict[str, Any]:
         "citi_bills": citi_bills,
         "warnings": amex_warnings + citi_warnings
     }
-
-
-if __name__ == "__main__":
-    rules_mgr = RulesManager()
-    res = run_generation(rules_mgr, "manual_run")
-    print(f"Generación manual finalizada: {res}")

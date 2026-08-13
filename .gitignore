@@ -8,6 +8,7 @@ data/master/
 
 # 📁 Logs de ejecución
 logs/
+audit/
 *.log
 
 # 📁 Configuración privada
