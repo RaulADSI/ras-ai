@@ -1,58 +1,51 @@
+import csv
+import hashlib
 import pytest
-import sqlite3
-from scripts.persistence.ledger import Ledger
+from scripts.persistence.ledger import Ledger, connect
+from scripts.output.bulk_bill_generator import publish_reserved_batch
+from scripts.config import FINAL_APPFOLIO_COLUMNS
+
 
 @pytest.fixture
 def seeded_ledger(temp_db_conn):
-    """
-    Herregni akka wal-qixxaatu gochuu (10000 = 5000 + 5000).
-    """
-    temp_db_conn.execute("INSERT INTO transactions (id, bank_id, account_ref, bank_reference, provenance_hash, amount_cents, currency, original_date) VALUES (1, 'AMEX', '1234', 'REF1', 'HASH1', 10000, 'USD', '2026-08-12')")
-    temp_db_conn.execute("INSERT INTO allocations (id, transaction_id, amount_cents, eligibility_state) VALUES (1, 1, 5000, 'READY_TO_IMPORT')")
-    temp_db_conn.execute("INSERT INTO allocations (id, transaction_id, amount_cents, eligibility_state) VALUES (2, 1, 5000, 'REVIEW_REQUIRED')")
-    return Ledger(temp_db_conn), temp_db_conn
+    conn = temp_db_conn
+    conn.execute("INSERT INTO transactions (id,bank_id,account_ref,bank_reference,provenance_hash,amount_cents,currency,original_date) VALUES (1,'AMEX','1234','REF1','HASH1',10000,'USD','2026-08-12')")
+    conn.execute("INSERT INTO allocations (id,transaction_id,amount_cents,eligibility_state,property_code,vendor_name,gl_account,cash_account,description) VALUES (1,1,6001,'READY_TO_IMPORT','P1','Proveedor, ñ','6435','1150','Gasto'),(2,1,3999,'REVIEW_REQUIRED','','','','','')")
+    return Ledger(conn), conn
+
 
 def test_reserve_batch_only_ready_to_import(seeded_ledger):
     ledger, conn = seeded_ledger
     batch_id, snapshot = ledger.reserve_batch()
-    
-    assert batch_id is not None
-    assert len(snapshot) == 1  # Solo debe agarrar la fracción 1
-    assert snapshot[0]["allocation_id"] == 1
-    
-    # Verificar que el estado en BD cambió
-    cursor = conn.execute("SELECT delivery_state FROM export_items WHERE batch_id = ?", (batch_id,))
-    assert cursor.fetchone()[0] == 'RESERVED'
+    assert snapshot[0].allocation_id == 1
+    assert snapshot[0].amount_cents == 6001
+    assert ledger.reserve_batch() == (None, ())
+    with pytest.raises(AttributeError):
+        snapshot[0].amount_cents = 10000
 
-def test_mark_exported_lifecycle(seeded_ledger):
-    ledger, conn = seeded_ledger
-    batch_id, _ = ledger.reserve_batch()
-    
-    ledger.mark_exported(batch_id, "dummy_hash_123")
-    
-    # Verificar lote y estados
-    hash_val = conn.execute("SELECT file_hash FROM export_batches WHERE batch_id = ?", (batch_id,)).fetchone()[0]
-    assert hash_val == "dummy_hash_123"
-    
-    state = conn.execute("SELECT delivery_state FROM export_items WHERE batch_id = ?", (batch_id,)).fetchone()[0]
-    assert state == 'EXPORTED'
 
-def test_confirm_import_partial_success(seeded_ledger):
+def test_mark_exported_lifecycle(seeded_ledger, tmp_path):
     ledger, conn = seeded_ledger
-    # Añadir otra fracción ready para simular lote múltiple
-    conn.execute("INSERT INTO allocations (id, transaction_id, amount_cents, eligibility_state) VALUES (3, 1, 2000, 'READY_TO_IMPORT')")
-    
+    batch_id, snapshot = ledger.reserve_batch()
+    path = publish_reserved_batch(ledger, batch_id, tmp_path / 'exports')
+    with path.open(encoding='utf-8-sig', newline='') as stream:
+        reader = csv.DictReader(stream)
+        assert reader.fieldnames == FINAL_APPFOLIO_COLUMNS
+        rows = list(reader)
+    assert len(rows) == 1
+    assert rows[0]['Amount*'] == '60.01'
+    assert rows[0]['Vendor Payee Name*'] == 'Proveedor, ñ'
+    assert conn.execute('SELECT file_hash FROM export_batches').fetchone()[0] == hashlib.sha256(path.read_bytes()).hexdigest()
+    ledger.mark_exported(batch_id, path, snapshot)
+    assert conn.execute('SELECT delivery_state FROM export_items').fetchone()[0] == 'EXPORTED'
+
+
+def test_confirm_import_partial_success(seeded_ledger, tmp_path):
+    ledger, conn = seeded_ledger
+    conn.execute("UPDATE allocations SET eligibility_state='READY_TO_IMPORT',property_code='P2',vendor_name='Vendor',gl_account='6435',cash_account='1150' WHERE id=2")
     batch_id, _ = ledger.reserve_batch()
-    ledger.mark_exported(batch_id, "hash")
-    
-    # Confirmar 1 como éxito, 3 como fallo
-    ledger.confirm_import(batch_id, successful_refs={1: "APPFOLIO_REF_99"}, failed_allocs=[3])
-    
-    # Verificar éxito
-    row_success = conn.execute("SELECT delivery_state, appfolio_reference FROM export_items WHERE allocation_id = 1").fetchone()
-    assert row_success[0] == 'IMPORTED'
-    assert row_success[1] == 'APPFOLIO_REF_99'
-    
-    # Verificar retención del fallo
-    row_fail = conn.execute("SELECT delivery_state FROM export_items WHERE allocation_id = 3").fetchone()
-    assert row_fail[0] == 'IMPORT_FAILED_REVIEW'
+    publish_reserved_batch(ledger, batch_id, tmp_path / 'exports')
+    ledger.confirm_import(batch_id, {1: 'APP99'}, [2])
+    ledger.confirm_import(batch_id, {1: 'APP99'}, [2])
+    assert conn.execute('SELECT delivery_state FROM export_items ORDER BY allocation_id').fetchall() == [('IMPORTED',), ('IMPORT_FAILED_REVIEW',)]
+    assert ledger.reserve_batch() == (None, ())
