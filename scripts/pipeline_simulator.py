@@ -46,7 +46,8 @@ def _verify_coverage_invariants(conn):
 
 
 def run_pipeline_simulation(db_path, raw_records, invoices, classification_rules,
-                            inbox_dir, processed_dir, failed_dir, export_dir):
+                            inbox_dir, processed_dir, failed_dir, export_dir,
+                            *, reconciliation_blockers=None, approved_business_plans=None):
     db_path = Path(db_path).resolve()
     root = db_path.parent
     production = DATA_DIR.resolve()
@@ -75,8 +76,29 @@ def run_pipeline_simulation(db_path, raw_records, invoices, classification_rules
         ledger = Ledger(conn)
         report['stage'] = 'ingestion'
         report['ingestion'] = ledger.register_transactions(raw_records)
+        if approved_business_plans:
+            ledger.apply_business_allocation_plan(approved_business_plans)
+            classification_rules = {k:dict(v) for k,v in classification_rules.items()}
+            for detail in approved_business_plans:
+                if detail.get('flags'):
+                    raise ValueError('El plan aprobado contiene alertas pendientes')
+                parent = conn.execute('SELECT transaction_id FROM transaction_provenance WHERE provenance_hash=?',
+                                      (detail['provenance_hash'],)).fetchone()[0]
+                for allocation in ledger.pending_allocations():
+                    if allocation['transaction_id'] == parent:
+                        classification_rules[allocation['id']] = {
+                            k:allocation[k] for k in ('property_code','vendor_name','gl_account','cash_account','description')}
+            report['approved_business_plans'] = len(approved_business_plans)
         report['stage'] = 'reconciliation'
-        report['reconciliation'] = ReconciliationEngine(ledger).run(invoices, classification_rules)
+        if reconciliation_blockers:
+            report['reconciliation_blockers'] = list(reconciliation_blockers)
+            report['reconciliation'] = {}
+            for allocation in ledger.pending_allocations():
+                ledger.create_exception(allocation['id'], f"reconciliation_{allocation['id']}",
+                    'UNVERIFIED_APPFOLIO_SOURCE', {'blockers': list(reconciliation_blockers)})
+                report['reconciliation'][allocation['id']] = 'REVIEW_REQUIRED'
+        else:
+            report['reconciliation'] = ReconciliationEngine(ledger).run(invoices, classification_rules)
         report['stage'] = 'inbox'
         report['inbox'] = process_inbox(ledger, *directories[:3])
         report['stage'] = 'coverage'

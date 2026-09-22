@@ -127,6 +127,16 @@ class PipelineOrchestrator:
         })
 
     def run(self) -> bool:
+        from scripts.approved_pipeline import run_approved_pipeline
+        try:
+            report = run_approved_pipeline()
+            self.logger.info("AMEX completado: %s", report['outputs'])
+            return True
+        except Exception:
+            self.logger.exception("Pipeline detenido; no se publica un lote nuevo")
+            return False
+
+    def run_legacy(self) -> bool:
         self.logger.info(f"=== INICIANDO PIPELINE DE CONCILIACIÓN | RUN_ID: {self.run_id} ===")
         total_start = time.time()
         pipeline_success = True

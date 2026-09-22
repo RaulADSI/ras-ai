@@ -1,5 +1,7 @@
 """Conciliación de registros normalizados; no lee archivos ni cambia el orquestador."""
 from collections import Counter
+from dataclasses import asdict
+from scripts.vendor_aliases import lookup_vendor_alias
 from datetime import date
 from difflib import SequenceMatcher
 import math
@@ -7,7 +9,8 @@ import sqlite3
 
 
 def normalize_vendor(value):
-    return ' '.join(value.upper().split())
+    alias = lookup_vendor_alias(value)
+    return ' '.join((alias.vendor_name if alias else value).upper().split())
 
 
 class ReconciliationEngine:
@@ -39,6 +42,7 @@ class ReconciliationEngine:
             if len(invoice['currency']) != 3 or not invoice['currency'].isalpha() or not invoice['currency'].isupper():
                 raise ValueError('Moneda inválida')
             invoice['_date'] = date.fromisoformat(invoice['date'])
+            invoice['_bill_date'] = date.fromisoformat(invoice.get('bill_date', invoice['date']))
             if not isinstance(invoice.get('bank_reference', ''), str):
                 raise ValueError('Referencia bancaria inválida')
             ids.add(invoice['invoice_id'])
@@ -58,11 +62,13 @@ class ReconciliationEngine:
                 for invoice in invoices:
                     if invoice['amount_cents'] != allocation['amount_cents'] or invoice['currency'] != allocation['currency']:
                         continue
-                    days = abs((invoice['_date'] - date.fromisoformat(allocation['original_date'])).days)
-                    if days > self.window_days:
-                        continue
+                    bank_date = date.fromisoformat(allocation['original_date'])
+                    days = min(abs((invoice['_date'] - bank_date).days),
+                               abs((invoice['_bill_date'] - bank_date).days))
                     exact = normalize_vendor(vendor) == normalize_vendor(invoice['vendor_name'])
                     similarity = 100 if exact else 100 * SequenceMatcher(None, normalize_vendor(vendor), normalize_vendor(invoice['vendor_name'])).ratio()
+                    if days > self.window_days and (not exact or 'source_file_hash' not in invoice):
+                        continue
                     if similarity < 60:
                         continue
                     reference = invoice.get('bank_reference','').strip()
@@ -76,7 +82,9 @@ class ReconciliationEngine:
         for allocation, classification, reason, candidates in plans:
             allocation_id = allocation['id']
             if reason is None and candidates:
-                if len(candidates) != 1:
+                if any(c[0].get('review_only', False) for c in candidates):
+                    reason = 'POSSIBLE_OTHER_ACCOUNT_MATCH'
+                elif len(candidates) != 1:
                     reason = 'MULTIPLE_INVOICE_CANDIDATES'
                 else:
                     invoice, score, days, exact, conflict = candidates[0]
@@ -87,6 +95,8 @@ class ReconciliationEngine:
                         reason = 'MULTIPLE_ALLOCATION_CANDIDATES'
                     elif conflict:
                         reason = 'REFERENCE_CONFLICT'
+                    elif days > self.window_days:
+                        reason = 'EXISTING_INVOICE_DATE_DISCREPANCY'
                     elif score < self.min_score or (not exact and not self.allow_fuzzy):
                         reason = 'UNCERTAIN_VENDOR'
                     else:
@@ -94,6 +104,15 @@ class ReconciliationEngine:
                             currency=allocation['currency'],vendor_original=invoice['vendor_name'],
                             vendor_resolved=classification.get('vendor_name',allocation['vendor_name']),
                             method='exact' if exact else 'sequence_similarity',score=score,days=days)
+                        merchant = classification.get('merchant_raw', classification.get('vendor_name', allocation['vendor_name']))
+                        identity = lookup_vendor_alias(merchant)
+                        if identity:
+                            details['merchant_identity'] = asdict(identity)
+                            details['method'] = 'explicit_alias'
+                            details['vendor_resolved'] = identity.vendor_name
+                        details['source_evidence'] = {key: invoice.get(key) for key in
+                            ('reference','bank_account','identity_type','source_file_hash','source_lines','properties',
+                             'bill_date','date_basis','payment_dates','paid_cents','unpaid_cents')}
                         try:
                             self.ledger.match_invoice(allocation_id, invoice_id, details)
                         except sqlite3.IntegrityError:
@@ -107,6 +126,9 @@ class ReconciliationEngine:
                             continue
             if reason is None:
                 values = {key: classification.get(key, allocation[key]) for key in fields}
+                alias = lookup_vendor_alias(values['vendor_name'])
+                if alias:
+                    values['vendor_name'] = alias.vendor_name
                 try:
                     self.ledger.validate_classification(**values)
                 except ValueError:
@@ -116,6 +138,8 @@ class ReconciliationEngine:
                     results[allocation_id] = 'READY_TO_IMPORT'
                     continue
             self.ledger.create_exception(allocation_id, f'reconciliation_{allocation_id}', reason,
-                dict(candidate_invoice_ids=[c[0]['invoice_id'] for c in candidates], classification=classification))
+                dict(candidate_invoice_ids=[c[0]['invoice_id'] for c in candidates],
+                     candidate_evidence=[{key:c[0].get(key) for key in ('invoice_id','reference','bank_account','source_lines','source_file_hash')} for c in candidates],
+                     classification=classification))
             results[allocation_id] = 'REVIEW_REQUIRED'
         return results

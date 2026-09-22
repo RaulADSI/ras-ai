@@ -108,3 +108,10 @@ def test_refuse_external_inbox(environment,tmp_path):
     with pytest.raises(ValueError):
         simulator.run_pipeline_simulation(root/'ledger.db',[],[],{},external,root/'processed',root/'failed',root/'exports')
     assert not (root/'ledger.db').exists()
+
+def test_unverified_ledger_never_means_no_existing_bills(environment):
+    root,records,_=environment
+    report=simulator.run_pipeline_simulation(root/'ledger.db',records,[],{i:classification() for i in range(1,7)},root/'inbox',root/'processed',root/'failed',root/'exports',reconciliation_blockers=['Missing invoice identity'])
+    assert report['allocations_state']=={'REVIEW_REQUIRED':6}
+    assert report['export']['exported_items']==0
+    assert report['reconciliation_blockers']==['Missing invoice identity']

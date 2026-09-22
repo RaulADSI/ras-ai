@@ -219,6 +219,11 @@ class RulesManager:
 
         raw_display = str(merchant_raw).strip()
 
+        from scripts.vendor_aliases import lookup_vendor_alias
+        alias = lookup_vendor_alias(merchant_raw)
+        if alias:
+            return alias.vendor_name, 100.0, "explicit_alias"
+
         # 1. Manual Overrides
         for pattern, target in self.manual_vendor_matchers:
             if pattern.search(norm_merchant):

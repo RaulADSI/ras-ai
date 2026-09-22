@@ -143,3 +143,55 @@ def test_negative_invoice_and_inclusive_window(temp_db_conn):
     temp_db_conn.execute('UPDATE allocations SET amount_cents=-5000')
     result=ReconciliationEngine(ledger).run([invoice(amount_cents=-5000,date='2026-08-17')],{1:classification()})
     assert result=={1:'MATCHED_EXISTING'}
+
+
+@pytest.mark.parametrize('merchant,variant', [
+    ('SYKES ACE HARDWARE 0MIAMI FL', 'Sykes Ace Hardware'),
+    ('ACE HDWE OF OPA LOCKA OPA LOCKA FL', 'Ace Hardware of Opa Locka'),
+])
+def test_explicit_ace_alias_preserves_identity(temp_db_conn, merchant, variant):
+    from scripts.vendor_aliases import lookup_vendor_alias
+    identity = lookup_vendor_alias(merchant)
+    assert identity.merchant_raw == merchant
+    assert identity.merchant_variant == variant
+    ledger = seed(temp_db_conn)
+    assert ReconciliationEngine(ledger).run(
+        [invoice(vendor_name='Hardware, ACE')],
+        {1: classification(vendor_name=merchant)},
+    ) == {1: 'MATCHED_EXISTING'}
+    evidence = str(temp_db_conn.execute('SELECT * FROM invoice_matches').fetchall())
+    assert variant in evidence
+    assert merchant in evidence
+    assert 'explicit_alias' in evidence
+
+
+def test_ace_alias_does_not_guess():
+    from scripts.vendor_aliases import lookup_vendor_alias
+    for merchant in ('ACE', 'PALACE HARDWARE', 'OTHER ACE HARDWARE', 'SYKES ACE HARDWARE UNKNOWN'):
+        assert lookup_vendor_alias(merchant) is None
+
+
+def test_ace_alias_multiple_invoices_stays_review(temp_db_conn):
+    ledger = seed(temp_db_conn)
+    assert ReconciliationEngine(ledger).run(
+        [invoice(vendor_name='Hardware, ACE'), invoice(invoice_id='I2', vendor_name='Hardware, ACE')],
+        {1: classification(vendor_name='SYKES ACE HARDWARE')},
+    ) == {1: 'REVIEW_REQUIRED'}
+
+
+def test_bill_date_matches_when_payment_is_later(temp_db_conn):
+    ledger = seed(temp_db_conn)
+    assert ReconciliationEngine(ledger).run(
+        [invoice(date='2026-09-10', bill_date='2026-08-11', source_file_hash='x')],
+        {1: classification()},
+    ) == {1: 'MATCHED_EXISTING'}
+
+
+def test_ledger_candidate_outside_window_blocks_bulk(temp_db_conn):
+    ledger = seed(temp_db_conn)
+    assert ReconciliationEngine(ledger).run(
+        [invoice(date='2026-09-10', bill_date='2026-08-19', source_file_hash='x')],
+        {1: classification()},
+    ) == {1: 'REVIEW_REQUIRED'}
+    assert ledger.reserve_batch() == (None, ())
+    assert temp_db_conn.execute('SELECT reason FROM exceptions').fetchone()[0] == 'EXISTING_INVOICE_DATE_DISCREPANCY'

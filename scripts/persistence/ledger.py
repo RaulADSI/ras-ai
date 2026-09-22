@@ -218,6 +218,41 @@ class Ledger:
             ORDER BY a.id''')
         return [dict(zip([c[0] for c in cursor.description], row)) for row in cursor.fetchall()]
 
+    def apply_business_allocation_plan(self, details):
+        """Persiste clasificación/prorrateos en revisión antes de conciliar, una sola vez."""
+        with self._atomic():
+            for detail in details:
+                payload = json.dumps(detail,sort_keys=True,allow_nan=False)
+                token = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+                provenance = detail['provenance_hash']
+                prior = self.conn.execute("SELECT payload_json FROM audit_events WHERE event_type='BUSINESS_ALLOCATION_PLAN'").fetchall()
+                old = [json.loads(r[0]) for r in prior if json.loads(r[0]).get('provenance_hash') == provenance]
+                if old:
+                    if old[-1]['plan_hash'] != token:
+                        raise ValueError('El plan aplicado cambió: requiere revisión explícita')
+                    continue
+                parent = self.conn.execute('''SELECT t.id,t.amount_cents FROM transaction_provenance p
+                    JOIN transactions t ON t.id=p.transaction_id WHERE p.provenance_hash=?''',(provenance,)).fetchone()
+                if parent is None:
+                    raise ValueError('Evento no registrado')
+                existing = self.conn.execute('SELECT id,amount_cents FROM allocations WHERE transaction_id=?',(parent[0],)).fetchall()
+                if len(existing)!=1 or existing[0][1]!=parent[1]:
+                    raise ValueError('El evento ya fue dividido')
+                allocation_id=existing[0][0]
+                self._reviewable(allocation_id)
+                if self.conn.execute('SELECT 1 FROM exceptions WHERE allocation_id=?',(allocation_id,)).fetchone():
+                    raise ValueError('Hay revisión previa: no se puede sustituir el plan')
+                fractions=detail['fractions']
+                self.validate_coverage_and_signs(parent[1],[f['amount_cents'] for f in fractions])
+                for index,fraction in enumerate(fractions):
+                    values=(fraction['amount_cents'],fraction['property_code'],detail['vendor_name'],detail['gl_account'],detail['cash_account'],detail['merchant_original'])
+                    if index==0:
+                        self.conn.execute('''UPDATE allocations SET amount_cents=?,property_code=?,vendor_name=?,gl_account=?,cash_account=?,description=? WHERE id=?''',values+(allocation_id,))
+                    else:
+                        self.conn.execute('''INSERT INTO allocations(amount_cents,property_code,vendor_name,gl_account,cash_account,description,transaction_id,eligibility_state)
+                            VALUES (?,?,?,?,?,?,?,'REVIEW_REQUIRED')''',values+(parent[0],))
+                self._audit('BUSINESS_ALLOCATION_PLAN',dict(provenance_hash=provenance,plan_hash=token,details=detail))
+
     def consumed_invoice_ids(self):
         return {r[0] for r in self.conn.execute('SELECT appfolio_invoice_id FROM invoice_matches')}
 
