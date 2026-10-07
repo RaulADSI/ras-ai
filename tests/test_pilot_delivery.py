@@ -4,6 +4,7 @@ import pytest
 
 from scripts.persistence.ledger import Ledger
 from scripts.review.delivery import deliver
+from scripts.review.drive_receipt import prepare_receipt
 from scripts.review.pilot_delivery import create_override
 from scripts.review.security import ReviewAccess
 from scripts.review.service import ReviewService
@@ -75,3 +76,20 @@ def test_pilot_override_requires_exact_apps_script_deployment_url(temp_db_conn, 
     with pytest.raises(ValueError, match="Apps Script"):
         create_override(service, request_id=request_id, recipient="martha@rentify.live", transaction_id=1,
                         form_url=form_url)
+
+
+def test_expired_request_rejects_apps_script_receipt_before_any_decision(temp_db_conn):
+    service = ReviewService(temp_db_conn)
+    request_id = _request(service)
+    item_id, provenance, source_row, amount = temp_db_conn.execute('''SELECT i.item_id,p.provenance_hash,p.row_number,t.amount_cents
+        FROM review_items i JOIN transaction_provenance p ON p.transaction_id=i.transaction_id
+        JOIN transactions t ON t.id=i.transaction_id WHERE i.request_id=?''', (request_id,)).fetchone()
+    manifest = {"request_id": request_id, "items": [dict(transaction_id=1, item_id=item_id,
+        historical_provenance=provenance, source_row=source_row, amount_cents=amount, company="RAS")]}
+    receipt = {"schema_version": 1, "submission_id": "expired-pilot-receipt", "received_at": "2100-01-02T00:00:00Z",
+        "payload": {"report_type": "property_assignment_response", "responses": [dict(
+            provenance_hash=provenance, source_row=source_row, amount_cents=amount, property="", notes="")]}}
+    service.now = lambda: "2100-01-02T00:00:00+00:00"
+    with pytest.raises(ValueError, match="expired"):
+        prepare_receipt(service, receipt, manifest)
+    assert temp_db_conn.execute("SELECT count(*) FROM review_submissions").fetchone() == (0,)
