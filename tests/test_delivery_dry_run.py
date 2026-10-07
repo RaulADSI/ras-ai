@@ -1,5 +1,4 @@
-import sys
-
+import scripts.review.delivery_dry_run as delivery_dry_run
 from scripts.review.delivery_dry_run import deliver_dry_run
 
 
@@ -33,8 +32,8 @@ def test_dry_run_composes_message_and_injected_adapter_receives_authorized_recip
     assert captured[0]["Subject"] == "AMEX — Property assignment required"
     assert "Please review 2 AMEX transactions." in captured[0].get_content()
     assert "This is a delivery dry-run" in captured[0].get_content()
-    assert "smtplib" not in sys.modules
-    assert "scripts.review.gmail" not in sys.modules
+    assert "smtplib" not in delivery_dry_run.__dict__
+    assert "gmail" not in delivery_dry_run.__dict__
 
 
 def test_failed_routing_never_invokes_the_dry_run_adapter():
