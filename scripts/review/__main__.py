@@ -40,6 +40,7 @@ def main():
     send.add_argument('request_id')
     send.add_argument('--retry-uncertain', action='store_true')
     send.add_argument('--pilot-override', help='One-time audited pilot override ID')
+    send.add_argument('--pilot-recovery', help='One-time audited recovery ID')
     args = parser.parse_args()
     if args.action == 'catalog-inspect':
         from scripts.review.catalog import inspect_mapping_rules
@@ -97,9 +98,10 @@ def main():
             access = ReviewAccess(service, os.environ['RENTIFY_REVIEW_SECRET'])
             sender = configured_sender()
             print(deliver(service, access, args.request_id,
-                          origin=None if args.pilot_override else os.environ['RENTIFY_REVIEW_ORIGIN'],
+                          origin=None if (args.pilot_override or args.pilot_recovery) else os.environ['RENTIFY_REVIEW_ORIGIN'],
                           sender=os.environ['RENTIFY_REVIEW_SENDER'], send=sender,
-                          retry_uncertain=args.retry_uncertain, pilot_override_id=args.pilot_override))
+                          retry_uncertain=args.retry_uncertain, pilot_override_id=args.pilot_override,
+                          pilot_recovery_id=args.pilot_recovery))
     finally:
         conn.close()
 

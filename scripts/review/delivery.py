@@ -5,12 +5,15 @@ from email.message import EmailMessage
 from urllib.parse import urlsplit
 
 from scripts.review.security import public_origin
-from scripts.review.pilot_delivery import begin_dispatch, finish_dispatch
+from scripts.review.pilot_delivery import (begin_dispatch, begin_recovery_dispatch,
+                                           finish_dispatch, finish_recovery_dispatch)
 
 
 def deliver(service, access, request_id, *, origin=None, sender, send, retry_uncertain=False,
-            pilot_override_id=None):
-    if pilot_override_id is None:
+            pilot_override_id=None, pilot_recovery_id=None):
+    if pilot_override_id is not None and pilot_recovery_id is not None:
+        raise ValueError('Choose one pilot delivery path')
+    if pilot_override_id is None and pilot_recovery_id is None:
         origin = public_origin(origin)
     if not isinstance(sender, str) or '@' not in sender or '\n' in sender or '\r' in sender:
         raise ValueError('Configured sender required')
@@ -21,12 +24,17 @@ def deliver(service, access, request_id, *, origin=None, sender, send, retry_unc
         if delivery == ('SENT',):
             return 'SENT'
         # A crash while SENDING may have delivered mail. Never retry silently.
-        if delivery and delivery[0] in ('SENDING', 'UNCERTAIN') and not retry_uncertain:
+        recovery = pilot_recovery_id is not None
+        if delivery and delivery[0] in ('SENDING', 'UNCERTAIN') and not (retry_uncertain or (recovery and delivery[0] == 'UNCERTAIN')):
             raise ValueError('Delivery outcome uncertain; check provider before explicit retry')
         if pilot_override_id is not None:
             if retry_uncertain:
                 raise ValueError('One-time pilot delivery overrides cannot be retried')
             pilot = begin_dispatch(service, request_id=request_id, override_id=pilot_override_id)
+        elif pilot_recovery_id is not None:
+            if retry_uncertain:
+                raise ValueError('One-time pilot delivery recoveries cannot be retried')
+            pilot = begin_recovery_dispatch(service, request_id=request_id, recovery_id=pilot_recovery_id)
         service.conn.execute("UPDATE review_deliveries SET status='SENDING',attempts=attempts+1,updated_at=? WHERE request_id=?", (service.now(), request_id))
     message = EmailMessage()
     message['Subject'] = 'AMEX — Piloto controlado: asignación de propiedad' if pilot else 'AMEX — Property assignment required'
@@ -52,17 +60,22 @@ def deliver(service, access, request_id, *, origin=None, sender, send, retry_unc
     except Exception as exc:
         with service.ledger._atomic():
             service.conn.execute("UPDATE review_deliveries SET status='UNCERTAIN',last_error=?,updated_at=? WHERE request_id=?", (type(exc).__name__, service.now(), request_id))
-            if pilot:
+            if pilot_override_id is not None:
                 finish_dispatch(service, request_id=request_id, override_id=pilot_override_id, outcome='UNCERTAIN')
+            elif pilot_recovery_id is not None:
+                finish_recovery_dispatch(service, request_id=request_id, recovery_id=pilot_recovery_id, outcome='UNCERTAIN')
             service.ledger._audit('REVIEW_DELIVERY_UNCERTAIN', dict(request_id=request_id, error_type=type(exc).__name__))
         raise RuntimeError('Email delivery outcome uncertain; inspect provider before retry') from None
     with service.ledger._atomic():
         service.conn.execute("UPDATE review_deliveries SET status='SENT',last_error=NULL,provider_reference=?,updated_at=? WHERE request_id=?", (str(reference or message['Message-ID']), service.now(), request_id))
-        if pilot:
+        if pilot_override_id is not None:
             finish_dispatch(service, request_id=request_id, override_id=pilot_override_id, outcome='CONSUMED')
+        elif pilot_recovery_id is not None:
+            finish_recovery_dispatch(service, request_id=request_id, recovery_id=pilot_recovery_id, outcome='CONSUMED')
         service.conn.execute("UPDATE review_requests SET status=CASE WHEN status='DRAFT' THEN 'SENT' ELSE status END,sent_at=? WHERE request_id=?", (service.now(), request_id))
         service.ledger._audit('REVIEW_EMAIL_SENT', dict(request_id=request_id, recipient=recipient,
-                                                        pilot_override_id=pilot_override_id))
+                                                        pilot_override_id=pilot_override_id,
+                                                        pilot_recovery_id=pilot_recovery_id))
     return 'SENT'
 
 

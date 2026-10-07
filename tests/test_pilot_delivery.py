@@ -5,7 +5,7 @@ import pytest
 from scripts.persistence.ledger import Ledger
 from scripts.review.delivery import deliver
 from scripts.review.drive_receipt import prepare_receipt
-from scripts.review.pilot_delivery import create_override
+from scripts.review.pilot_delivery import create_override, create_recovery_override
 from scripts.review.security import ReviewAccess
 from scripts.review.service import ReviewService
 
@@ -66,6 +66,15 @@ def test_pilot_override_failure_is_uncertain_and_never_reusable(temp_db_conn):
         deliver(service, ReviewAccess(service, SECRET), request_id,
                 sender="review@rentify.live", send=lambda message: "must-not-send",
                 pilot_override_id=override["override_id"])
+    recovery = create_recovery_override(service, original_override_id=override["override_id"])
+    captured = []
+    assert deliver(service, ReviewAccess(service, SECRET), request_id, sender="review@rentify.live",
+                   send=lambda message: captured.append(message) or "recovery-provider-id",
+                   pilot_recovery_id=recovery["recovery_id"]) == "SENT"
+    assert captured[0]["To"] == "martha@rentify.live"
+    assert temp_db_conn.execute("SELECT status FROM review_pilot_delivery_recoveries").fetchone() == ("CONSUMED",)
+    with pytest.raises(ValueError, match="already exists"):
+        create_recovery_override(service, original_override_id=override["override_id"])
 
 
 @pytest.mark.parametrize("form_url", ["https://example.test/exec", "http://script.google.com/x/exec",

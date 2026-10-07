@@ -101,3 +101,63 @@ def finish_dispatch(service, *, request_id: str, override_id: str, outcome: str)
         raise ValueError("Pilot delivery override dispatch state changed")
     service.ledger._audit("PILOT_DELIVERY_OVERRIDE_" + outcome,
                           dict(override_id=override_id, request_id=request_id, outcome=outcome))
+
+
+def create_recovery_override(service, *, original_override_id: str) -> dict[str, Any]:
+    """Authorize one explicit recovery only after a confirmed non-delivery."""
+    with service.ledger._atomic():
+        row = service.conn.execute('''SELECT request_id,recipient,transaction_id,status
+                                      FROM review_pilot_delivery_overrides WHERE override_id=?''',
+                                   (original_override_id,)).fetchone()
+        if row is None or row[3] != "UNCERTAIN":
+            raise ValueError("Only an uncertain pilot override can be recovered")
+        request_id, recipient, transaction_id, _ = row
+        if service.conn.execute('SELECT 1 FROM review_pilot_delivery_recoveries WHERE original_override_id=?',
+                                (original_override_id,)).fetchone():
+            raise ValueError("Pilot delivery recovery already exists")
+        service.active(request_id)
+        delivery = service.conn.execute('SELECT status FROM review_deliveries WHERE request_id=?', (request_id,)).fetchone()
+        if delivery != ("UNCERTAIN",):
+            raise ValueError("Pilot delivery is not awaiting recovery")
+        recovery_id, now = uuid.uuid4().hex, service.now()
+        service.conn.execute('''INSERT INTO review_pilot_delivery_recoveries
+            (recovery_id,original_override_id,confirmation,status,created_at) VALUES (?,?,?,?,?)''',
+            (recovery_id, original_override_id, "OPERATOR_CONFIRMED_NO_DELIVERY", "ACTIVE", now))
+        evidence = dict(recovery_id=recovery_id, original_override_id=original_override_id,
+                        request_id=request_id, pilot_recipient=recipient, transaction_id=transaction_id,
+                        confirmation="OPERATOR_CONFIRMED_NO_DELIVERY", scope="ONE_TIME")
+        service.ledger._audit("PILOT_DELIVERY_RECOVERY_CREATED", evidence)
+        return evidence
+
+
+def begin_recovery_dispatch(service, *, request_id: str, recovery_id: str) -> dict[str, Any]:
+    row = service.conn.execute('''SELECT r.original_override_id,r.confirmation,r.status,o.recipient,o.transaction_id,
+                                         l.form_url,l.form_url_sha256
+                                  FROM review_pilot_delivery_recoveries r
+                                  JOIN review_pilot_delivery_overrides o ON o.override_id=r.original_override_id
+                                  JOIN review_pilot_form_links l ON l.override_id=o.override_id
+                                  WHERE r.recovery_id=? AND o.request_id=?''', (recovery_id, request_id)).fetchone()
+    if row is None:
+        raise ValueError("Pilot delivery recovery unavailable")
+    original_override_id, confirmation, status, recipient, transaction_id, form_url, form_hash = row
+    if status != "ACTIVE" or confirmation != "OPERATOR_CONFIRMED_NO_DELIVERY":
+        raise ValueError("Pilot delivery recovery is not available")
+    if service.conn.execute("UPDATE review_pilot_delivery_recoveries SET status='SENDING' WHERE recovery_id=? AND status='ACTIVE'",
+                            (recovery_id,)).rowcount != 1:
+        raise ValueError("Pilot delivery recovery is not available")
+    evidence = dict(recovery_id=recovery_id, original_override_id=original_override_id, request_id=request_id,
+                    pilot_recipient=recipient, transaction_id=transaction_id, form_url=form_url,
+                    form_url_sha256=form_hash, confirmation=confirmation, scope="ONE_TIME")
+    service.ledger._audit("PILOT_DELIVERY_RECOVERY_DISPATCHING", evidence)
+    return evidence
+
+
+def finish_recovery_dispatch(service, *, request_id: str, recovery_id: str, outcome: str) -> None:
+    if outcome not in {"CONSUMED", "UNCERTAIN"}:
+        raise ValueError("Invalid pilot recovery outcome")
+    if service.conn.execute('''UPDATE review_pilot_delivery_recoveries SET status=?,consumed_at=?
+                               WHERE recovery_id=? AND status='SENDING' ''',
+                            (outcome, service.now(), recovery_id)).rowcount != 1:
+        raise ValueError("Pilot delivery recovery dispatch state changed")
+    service.ledger._audit("PILOT_DELIVERY_RECOVERY_" + outcome,
+                          dict(recovery_id=recovery_id, request_id=request_id, outcome=outcome))
