@@ -8,9 +8,10 @@ from scripts.review.security import public_origin
 from scripts.review.pilot_delivery import begin_dispatch, finish_dispatch
 
 
-def deliver(service, access, request_id, *, origin, sender, send, retry_uncertain=False,
+def deliver(service, access, request_id, *, origin=None, sender, send, retry_uncertain=False,
             pilot_override_id=None):
-    origin = public_origin(origin)
+    if pilot_override_id is None:
+        origin = public_origin(origin)
     if not isinstance(sender, str) or '@' not in sender or '\n' in sender or '\r' in sender:
         raise ValueError('Configured sender required')
     pilot = None
@@ -28,7 +29,7 @@ def deliver(service, access, request_id, *, origin, sender, send, retry_uncertai
             pilot = begin_dispatch(service, request_id=request_id, override_id=pilot_override_id)
         service.conn.execute("UPDATE review_deliveries SET status='SENDING',attempts=attempts+1,updated_at=? WHERE request_id=?", (service.now(), request_id))
     message = EmailMessage()
-    message['Subject'] = 'AMEX — Property assignment required'
+    message['Subject'] = 'AMEX — Piloto controlado: asignación de propiedad' if pilot else 'AMEX — Property assignment required'
     recipient = pilot['pilot_recipient'] if pilot else request['recipient']
     message['From'], message['To'] = sender, recipient
     message['Message-ID'] = f'<rentify-review-{request_id}@{urlsplit(origin).hostname}>'
@@ -36,7 +37,7 @@ def deliver(service, access, request_id, *, origin, sender, send, retry_uncertai
     if pilot:
         message.set_content(f"Por favor revisa únicamente la transacción AMEX del piloto (ID {pilot['transaction_id']}).\n"
                             f"Empresa: {request['company']}\nTotal de la solicitud: {request['currency']} {'-' if amount < 0 else ''}{abs(amount)//100}.{abs(amount)%100:02d}\n\n"
-                            f"Formulario existente: {origin}/review/{request_id}?token={access.token(request_id)}\n\n"
+                            f"Formulario existente: {pilot['form_url']}\n\n"
                             "Deja los demás ítems en estado PENDING. Este es un piloto controlado: no autoriza ningún batch, CSV ni importación a AppFolio.\n"
                             f"El enlace vence el {request['expires_at']}. No lo reenvíes.\n")
     else:
