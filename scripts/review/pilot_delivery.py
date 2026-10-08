@@ -161,3 +161,57 @@ def finish_recovery_dispatch(service, *, request_id: str, recovery_id: str, outc
         raise ValueError("Pilot delivery recovery dispatch state changed")
     service.ledger._audit("PILOT_DELIVERY_RECOVERY_" + outcome,
                           dict(recovery_id=recovery_id, request_id=request_id, outcome=outcome))
+
+
+def create_second_recovery(service, *, prior_recovery_id: str) -> dict[str, Any]:
+    """Create a final, explicit recovery after verified non-delivery and channel repair."""
+    with service.ledger._atomic():
+        row = service.conn.execute('''SELECT r.original_override_id,o.request_id,o.recipient,o.transaction_id,r.status
+                                      FROM review_pilot_delivery_recoveries r
+                                      JOIN review_pilot_delivery_overrides o ON o.override_id=r.original_override_id
+                                      WHERE r.recovery_id=?''', (prior_recovery_id,)).fetchone()
+        if row is None or row[4] != "UNCERTAIN":
+            raise ValueError("Only an uncertain pilot recovery can be recovered")
+        original_override_id, request_id, recipient, transaction_id, _ = row
+        if service.conn.execute('SELECT 1 FROM review_pilot_delivery_second_recoveries WHERE prior_recovery_id=?',
+                                (prior_recovery_id,)).fetchone():
+            raise ValueError("Pilot second recovery already exists")
+        service.active(request_id)
+        if service.conn.execute('SELECT status FROM review_deliveries WHERE request_id=?', (request_id,)).fetchone() != ("UNCERTAIN",):
+            raise ValueError("Pilot delivery is not awaiting second recovery")
+        recovery_id, now = uuid.uuid4().hex, service.now()
+        confirmation = "OPERATOR_CONFIRMED_NO_DELIVERY_AND_CHANNEL_CORRECTED"
+        service.conn.execute('''INSERT INTO review_pilot_delivery_second_recoveries
+            (recovery_id,prior_recovery_id,confirmation,status,created_at) VALUES (?,?,?,?,?)''',
+            (recovery_id, prior_recovery_id, confirmation, "ACTIVE", now))
+        evidence = dict(recovery_id=recovery_id, prior_recovery_id=prior_recovery_id,
+                        original_override_id=original_override_id, request_id=request_id,
+                        pilot_recipient=recipient, transaction_id=transaction_id,
+                        confirmation=confirmation, scope="ONE_TIME")
+        service.ledger._audit("PILOT_DELIVERY_SECOND_RECOVERY_CREATED", evidence)
+        return evidence
+
+
+def begin_second_recovery_dispatch(service, *, request_id: str, recovery_id: str) -> dict[str, Any]:
+    row = service.conn.execute('''SELECT s.prior_recovery_id,s.confirmation,s.status,r.original_override_id,o.recipient,o.transaction_id,l.form_url,l.form_url_sha256
+        FROM review_pilot_delivery_second_recoveries s JOIN review_pilot_delivery_recoveries r ON r.recovery_id=s.prior_recovery_id
+        JOIN review_pilot_delivery_overrides o ON o.override_id=r.original_override_id JOIN review_pilot_form_links l ON l.override_id=o.override_id
+        WHERE s.recovery_id=? AND o.request_id=?''', (recovery_id, request_id)).fetchone()
+    if row is None or row[2] != "ACTIVE":
+        raise ValueError("Pilot second recovery is not available")
+    prior_recovery_id, confirmation, _, original_override_id, recipient, transaction_id, form_url, form_hash = row
+    if service.conn.execute("UPDATE review_pilot_delivery_second_recoveries SET status='SENDING' WHERE recovery_id=? AND status='ACTIVE'", (recovery_id,)).rowcount != 1:
+        raise ValueError("Pilot second recovery is not available")
+    evidence = dict(recovery_id=recovery_id, prior_recovery_id=prior_recovery_id, original_override_id=original_override_id,
+                    request_id=request_id, pilot_recipient=recipient, transaction_id=transaction_id, form_url=form_url,
+                    form_url_sha256=form_hash, confirmation=confirmation, scope="ONE_TIME")
+    service.ledger._audit("PILOT_DELIVERY_SECOND_RECOVERY_DISPATCHING", evidence)
+    return evidence
+
+
+def finish_second_recovery_dispatch(service, *, request_id: str, recovery_id: str, outcome: str) -> None:
+    if outcome not in {"CONSUMED", "UNCERTAIN"}:
+        raise ValueError("Invalid pilot second recovery outcome")
+    if service.conn.execute("UPDATE review_pilot_delivery_second_recoveries SET status=?,consumed_at=? WHERE recovery_id=? AND status='SENDING'", (outcome, service.now(), recovery_id)).rowcount != 1:
+        raise ValueError("Pilot second recovery dispatch state changed")
+    service.ledger._audit("PILOT_DELIVERY_SECOND_RECOVERY_" + outcome, dict(recovery_id=recovery_id, request_id=request_id, outcome=outcome))

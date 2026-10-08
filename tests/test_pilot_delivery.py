@@ -5,7 +5,7 @@ import pytest
 from scripts.persistence.ledger import Ledger
 from scripts.review.delivery import deliver
 from scripts.review.drive_receipt import prepare_receipt
-from scripts.review.pilot_delivery import create_override, create_recovery_override
+from scripts.review.pilot_delivery import create_override, create_recovery_override, create_second_recovery
 from scripts.review.security import ReviewAccess
 from scripts.review.service import ReviewService
 
@@ -75,6 +75,30 @@ def test_pilot_override_failure_is_uncertain_and_never_reusable(temp_db_conn):
     assert temp_db_conn.execute("SELECT status FROM review_pilot_delivery_recoveries").fetchone() == ("CONSUMED",)
     with pytest.raises(ValueError, match="already exists"):
         create_recovery_override(service, original_override_id=override["override_id"])
+
+
+def test_second_recovery_requires_prior_uncertain_outcome_and_is_one_time(temp_db_conn):
+    service = ReviewService(temp_db_conn)
+    request_id = _request(service)
+    override = create_override(service, request_id=request_id, recipient="martha@rentify.live", transaction_id=1,
+                               form_url=FORM_URL)
+    failing_send = lambda message: (_ for _ in ()).throw(TimeoutError())
+    with pytest.raises(RuntimeError, match="uncertain"):
+        deliver(service, ReviewAccess(service, SECRET), request_id, sender="review@rentify.live",
+                send=failing_send, pilot_override_id=override["override_id"])
+    first = create_recovery_override(service, original_override_id=override["override_id"])
+    with pytest.raises(RuntimeError, match="uncertain"):
+        deliver(service, ReviewAccess(service, SECRET), request_id, sender="review@rentify.live",
+                send=failing_send, pilot_recovery_id=first["recovery_id"])
+    second = create_second_recovery(service, prior_recovery_id=first["recovery_id"])
+    captured = []
+    assert deliver(service, ReviewAccess(service, SECRET), request_id, sender="review@rentify.live",
+                   send=lambda message: captured.append(message) or "second-recovery-provider-id",
+                   pilot_second_recovery_id=second["recovery_id"]) == "SENT"
+    assert captured[0]["To"] == "martha@rentify.live"
+    assert temp_db_conn.execute("SELECT status FROM review_pilot_delivery_second_recoveries").fetchone() == ("CONSUMED",)
+    with pytest.raises(ValueError, match="already exists"):
+        create_second_recovery(service, prior_recovery_id=first["recovery_id"])
 
 
 @pytest.mark.parametrize("form_url", ["https://example.test/exec", "http://script.google.com/x/exec",

@@ -6,14 +6,16 @@ from urllib.parse import urlsplit
 
 from scripts.review.security import public_origin
 from scripts.review.pilot_delivery import (begin_dispatch, begin_recovery_dispatch,
-                                           finish_dispatch, finish_recovery_dispatch)
+                                           begin_second_recovery_dispatch, finish_dispatch, finish_recovery_dispatch,
+                                           finish_second_recovery_dispatch)
 
 
 def deliver(service, access, request_id, *, origin=None, sender, send, retry_uncertain=False,
-            pilot_override_id=None, pilot_recovery_id=None):
-    if pilot_override_id is not None and pilot_recovery_id is not None:
+            pilot_override_id=None, pilot_recovery_id=None, pilot_second_recovery_id=None):
+    pilot_paths = (pilot_override_id, pilot_recovery_id, pilot_second_recovery_id)
+    if sum(path is not None for path in pilot_paths) > 1:
         raise ValueError('Choose one pilot delivery path')
-    if pilot_override_id is None and pilot_recovery_id is None:
+    if not any(path is not None for path in pilot_paths):
         origin = public_origin(origin)
     if not isinstance(sender, str) or '@' not in sender or '\n' in sender or '\r' in sender:
         raise ValueError('Configured sender required')
@@ -24,7 +26,7 @@ def deliver(service, access, request_id, *, origin=None, sender, send, retry_unc
         if delivery == ('SENT',):
             return 'SENT'
         # A crash while SENDING may have delivered mail. Never retry silently.
-        recovery = pilot_recovery_id is not None
+        recovery = pilot_recovery_id is not None or pilot_second_recovery_id is not None
         if delivery and delivery[0] in ('SENDING', 'UNCERTAIN') and not (retry_uncertain or (recovery and delivery[0] == 'UNCERTAIN')):
             raise ValueError('Delivery outcome uncertain; check provider before explicit retry')
         if pilot_override_id is not None:
@@ -35,6 +37,11 @@ def deliver(service, access, request_id, *, origin=None, sender, send, retry_unc
             if retry_uncertain:
                 raise ValueError('One-time pilot delivery recoveries cannot be retried')
             pilot = begin_recovery_dispatch(service, request_id=request_id, recovery_id=pilot_recovery_id)
+        elif pilot_second_recovery_id is not None:
+            if retry_uncertain:
+                raise ValueError('One-time pilot delivery recoveries cannot be retried')
+            pilot = begin_second_recovery_dispatch(service, request_id=request_id,
+                                                   recovery_id=pilot_second_recovery_id)
         service.conn.execute("UPDATE review_deliveries SET status='SENDING',attempts=attempts+1,updated_at=? WHERE request_id=?", (service.now(), request_id))
     message = EmailMessage()
     message['Subject'] = 'AMEX — Piloto controlado: asignación de propiedad' if pilot else 'AMEX — Property assignment required'
@@ -64,6 +71,9 @@ def deliver(service, access, request_id, *, origin=None, sender, send, retry_unc
                 finish_dispatch(service, request_id=request_id, override_id=pilot_override_id, outcome='UNCERTAIN')
             elif pilot_recovery_id is not None:
                 finish_recovery_dispatch(service, request_id=request_id, recovery_id=pilot_recovery_id, outcome='UNCERTAIN')
+            elif pilot_second_recovery_id is not None:
+                finish_second_recovery_dispatch(service, request_id=request_id,
+                                                recovery_id=pilot_second_recovery_id, outcome='UNCERTAIN')
             service.ledger._audit('REVIEW_DELIVERY_UNCERTAIN', dict(request_id=request_id, error_type=type(exc).__name__))
         raise RuntimeError('Email delivery outcome uncertain; inspect provider before retry') from None
     with service.ledger._atomic():
@@ -72,10 +82,14 @@ def deliver(service, access, request_id, *, origin=None, sender, send, retry_unc
             finish_dispatch(service, request_id=request_id, override_id=pilot_override_id, outcome='CONSUMED')
         elif pilot_recovery_id is not None:
             finish_recovery_dispatch(service, request_id=request_id, recovery_id=pilot_recovery_id, outcome='CONSUMED')
+        elif pilot_second_recovery_id is not None:
+            finish_second_recovery_dispatch(service, request_id=request_id,
+                                            recovery_id=pilot_second_recovery_id, outcome='CONSUMED')
         service.conn.execute("UPDATE review_requests SET status=CASE WHEN status='DRAFT' THEN 'SENT' ELSE status END,sent_at=? WHERE request_id=?", (service.now(), request_id))
         service.ledger._audit('REVIEW_EMAIL_SENT', dict(request_id=request_id, recipient=recipient,
                                                         pilot_override_id=pilot_override_id,
-                                                        pilot_recovery_id=pilot_recovery_id))
+                                                        pilot_recovery_id=pilot_recovery_id,
+                                                        pilot_second_recovery_id=pilot_second_recovery_id))
     return 'SENT'
 
 
