@@ -17,6 +17,40 @@ from scripts.config import (
     FINAL_APPFOLIO_COLUMNS
 )
 from scripts.rules_manager import RulesManager, normalize_text
+from scripts.output.snapshot_csv import snapshot_csv_bytes
+
+
+def publish_reserved_batch(ledger, batch_id, output_dir):
+    """Publica o recupera el mismo lote desde su instantánea persistida."""
+    import os
+    import tempfile
+    snapshot = ledger.get_snapshot(batch_id)
+    content = snapshot_csv_bytes(snapshot)
+    if not batch_id.startswith('batch_') or not batch_id[6:].isalnum():
+        raise ValueError('Identificador de lote inválido')
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / f'appfolio_{batch_id}.csv'
+    if not destination.exists():
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=output_dir, suffix='.tmp', delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if temporary.read_bytes() != content:
+                raise ValueError('Escritura incompleta del CSV')
+            # Publicación atómica sin sobrescribir un archivo existente.
+            try:
+                os.link(temporary, destination)
+            except FileExistsError:
+                pass
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    ledger.mark_exported(batch_id, destination, snapshot)
+    return destination
 
 
 def write_audit_log(df_errors: pd.DataFrame, log_filename: Path) -> None:
@@ -33,7 +67,6 @@ def split_allocations(df_netted: pd.DataFrame, property_groups: dict) -> pd.Data
     if not property_groups or df_netted.empty:
         return df_netted
 
-    # Mapeo normalizado e insensible a mayúsculas/espacios
     property_to_group = {
         normalize_text(prop): grp 
         for grp, props in property_groups.items() 
@@ -106,9 +139,16 @@ def process_card_dataset(
         pd.DataFrame(columns=FINAL_APPFOLIO_COLUMNS).to_csv(output_file, index=False, encoding="utf-8-sig")
         return 0, len(errors)
 
-    # 2. Resolución de Entidades
+    # 2. Resolución Contextualizada de Entidades
     df_valid["resolved_vendor"] = df_valid["merchant"].apply(lambda m: rules.resolve_vendor(m)[0])
-    df_valid["resolved_property"] = df_valid["property_hint"].apply(lambda p: rules.resolve_property(p)[0])
+    df_valid["resolved_property"] = df_valid.apply(
+        lambda r: rules.resolve_property(
+            r.get("property_hint"),
+            merchant=r.get("merchant"),
+            gl_account=r.get("gl_account")
+        )[0],
+        axis=1
+    )
     df_valid["abs_amount"] = df_valid["amount"].abs().round(2)
 
     # 3. Neteado de transacciones opuestas
@@ -155,6 +195,6 @@ def run_generation(rules: RulesManager, run_id: str) -> Dict[str, Any]:
 
     return {
         "amex_bills": amex_bills,
-        "citi_bills": citi_bills,
+        "citi_bills": citi_warnings,
         "warnings": amex_warnings + citi_warnings
     }
